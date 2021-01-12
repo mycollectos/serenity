@@ -1,57 +1,126 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #pragma once
 
-#include "Retainable.h"
-#include "RetainPtr.h"
-#include "Types.h"
+#include <AK/Badge.h>
+#include <AK/RefCounted.h>
+#include <AK/RefPtr.h>
+#include <AK/Span.h>
+#include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
-enum ShouldChomp { NoChomp, Chomp };
+enum ShouldChomp {
+    NoChomp,
+    Chomp
+};
 
-class StringImpl : public Retainable<StringImpl> {
+class StringImpl : public RefCounted<StringImpl> {
 public:
-    static Retained<StringImpl> create_uninitialized(ssize_t length, char*& buffer);
-    static RetainPtr<StringImpl> create(const char* cstring, ShouldChomp = NoChomp);
-    static RetainPtr<StringImpl> create(const char* cstring, ssize_t length, ShouldChomp = NoChomp);
-    Retained<StringImpl> to_lowercase() const;
-    Retained<StringImpl> to_uppercase() const;
+    static NonnullRefPtr<StringImpl> create_uninitialized(size_t length, char*& buffer);
+    static RefPtr<StringImpl> create(const char* cstring, ShouldChomp = NoChomp);
+    static RefPtr<StringImpl> create(const char* cstring, size_t length, ShouldChomp = NoChomp);
+    static RefPtr<StringImpl> create(ReadonlyBytes, ShouldChomp = NoChomp);
+    NonnullRefPtr<StringImpl> to_lowercase() const;
+    NonnullRefPtr<StringImpl> to_uppercase() const;
+
+    void operator delete(void* ptr)
+    {
+        kfree(ptr);
+    }
 
     static StringImpl& the_empty_stringimpl();
 
     ~StringImpl();
 
-    ssize_t length() const { return m_length; }
-    const char* characters() const { return m_characters; }
-    char operator[](ssize_t i) const { ASSERT(i >= 0 && i < m_length); return m_characters[i]; }
+    size_t length() const { return m_length; }
+    // Includes NUL-terminator.
+    const char* characters() const { return &m_inline_buffer[0]; }
+
+    ALWAYS_INLINE ReadonlyBytes bytes() const { return { characters(), length() }; }
+
+    const char& operator[](size_t i) const
+    {
+        ASSERT(i < m_length);
+        return characters()[i];
+    }
+
+    bool operator==(const StringImpl& other) const
+    {
+        if (length() != other.length())
+            return false;
+        return !__builtin_memcmp(characters(), other.characters(), length());
+    }
 
     unsigned hash() const
     {
-        if (!m_hasHash)
+        if (!m_has_hash)
             compute_hash();
         return m_hash;
     }
 
-private:
-    enum ConstructTheEmptyStringImplTag { ConstructTheEmptyStringImpl };
-    explicit StringImpl(ConstructTheEmptyStringImplTag) : m_characters("") { }
+    unsigned existing_hash() const
+    {
+        return m_hash;
+    }
 
-    enum ConstructWithInlineBufferTag { ConstructWithInlineBuffer };
-    StringImpl(ConstructWithInlineBufferTag, ssize_t length);
+    bool is_fly() const { return m_fly; }
+    void set_fly(Badge<FlyString>, bool fly) const { m_fly = fly; }
+
+private:
+    enum ConstructTheEmptyStringImplTag {
+        ConstructTheEmptyStringImpl
+    };
+    explicit StringImpl(ConstructTheEmptyStringImplTag)
+        : m_fly(true)
+    {
+        m_inline_buffer[0] = '\0';
+    }
+
+    enum ConstructWithInlineBufferTag {
+        ConstructWithInlineBuffer
+    };
+    StringImpl(ConstructWithInlineBufferTag, size_t length);
 
     void compute_hash() const;
 
-    ssize_t m_length { 0 };
-    mutable bool m_hasHash { false };
-    const char* m_characters { nullptr };
+    size_t m_length { 0 };
     mutable unsigned m_hash { 0 };
+    mutable bool m_has_hash { false };
+    mutable bool m_fly { false };
     char m_inline_buffer[0];
 };
 
-inline dword string_hash(const char* characters, int length)
+constexpr u32 string_hash(const char* characters, size_t length)
 {
-    dword hash = 0;
-    for (int i = 0; i < length; ++i) {
-        hash += (dword)characters[i];
+    u32 hash = 0;
+    for (size_t i = 0; i < length; ++i) {
+        hash += (u32)characters[i];
         hash += (hash << 10);
         hash ^= (hash >> 6);
     }
@@ -61,8 +130,17 @@ inline dword string_hash(const char* characters, int length)
     return hash;
 }
 
+template<>
+struct Formatter<StringImpl> : Formatter<StringView> {
+    void format(FormatBuilder& builder, const StringImpl& value)
+    {
+        Formatter<StringView>::format(builder, { value.characters(), value.length() });
+    }
+};
+
 }
 
-using AK::StringImpl;
 using AK::Chomp;
+using AK::NoChomp;
 using AK::string_hash;
+using AK::StringImpl;

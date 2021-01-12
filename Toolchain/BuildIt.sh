@@ -1,105 +1,285 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
+# This file will need to be run in bash, for now.
+
+
+# === CONFIGURATION AND SETUP ===
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-echo $DIR
+echo "$DIR"
 
-TARGET=i686-pc-serenity
-PREFIX="$DIR/Local"
-SYSROOT="$DIR/../Root"
+ARCH=${ARCH:-"i686"}
+TARGET="$ARCH-pc-serenity"
+PREFIX="$DIR/Local/$ARCH"
+BUILD=$(realpath "$DIR/../Build")
+SYSROOT="$BUILD/Root"
 
-echo PREFIX is $PREFIX
-echo SYSROOT is $SYSROOT
+MAKE="make"
+MD5SUM="md5sum"
+NPROC="nproc"
+
+if command -v ginstall &>/dev/null; then
+    INSTALL=ginstall
+else
+    INSTALL=install
+fi
+
+if [ "$(uname -s)" = "OpenBSD" ]; then
+    MAKE=gmake
+    MD5SUM="md5 -q"
+    NPROC="sysctl -n hw.ncpuonline"
+    export CC=egcc
+    export CXX=eg++
+    export with_gmp=/usr/local
+    export LDFLAGS=-Wl,-z,notext
+elif [ "$(uname -s)" = "FreeBSD" ]; then
+    MAKE=gmake
+    MD5SUM="md5 -q"
+    NPROC="sysctl -n hw.ncpu"
+    export with_gmp=/usr/local
+    export with_mpfr=/usr/local
+fi
+
+git_patch=
+while [ "$1" != "" ]; do
+    case $1 in
+        --dev )           git_patch=1
+                          ;;
+    esac
+    shift
+done
+
+echo PREFIX is "$PREFIX"
+echo SYSROOT is "$SYSROOT"
 
 mkdir -p "$DIR/Tarballs"
 
-source "$DIR/UseIt.sh"
+BINUTILS_VERSION="2.35.1"
+BINUTILS_MD5SUM="bca600eea3b8fc33ad3265c9c1eee8d4"
+BINUTILS_NAME="binutils-$BINUTILS_VERSION"
+BINUTILS_PKG="${BINUTILS_NAME}.tar.gz"
+BINUTILS_BASE_URL="http://ftp.gnu.org/gnu/binutils"
+
+GCC_VERSION="10.2.0"
+GCC_MD5SUM="941a8674ea2eeb33f5c30ecf08124874"
+GCC_NAME="gcc-$GCC_VERSION"
+GCC_PKG="${GCC_NAME}.tar.gz"
+GCC_BASE_URL="http://ftp.gnu.org/gnu/gcc"
+
+
+# === CHECK CACHE AND REUSE ===
+
+pushd "$DIR"
+    if [ "${TRY_USE_LOCAL_TOOLCHAIN}" = "y" ] ; then
+        # The actual logic had to be moved to .github/workflows/cmake.yml.
+        # Github Actions guarantees that Toolchain/Cache/ is empty on a cache
+        # miss, and non-empty on a cache hit.
+        # The following logic is correct *only* because of that.
+
+        mkdir -p Cache
+        echo "Cache (before):"
+        ls -l Cache
+        CACHED_TOOLCHAIN_ARCHIVE="Cache/ToolchainBinariesGithubActions.tar.gz"
+        if [ -r "${CACHED_TOOLCHAIN_ARCHIVE}" ] ; then
+            echo "Cache at ${CACHED_TOOLCHAIN_ARCHIVE} exists!"
+            echo "Extracting toolchain from cache:"
+            if tar xzf "${CACHED_TOOLCHAIN_ARCHIVE}" ; then
+                echo "Done 'building' the toolchain."
+                echo "Cache unchanged."
+                exit 0
+            else
+                echo
+                echo
+                echo
+                echo "Could not extract cached toolchain archive."
+                echo "This means the cache is broken and *should be removed*!"
+                echo "As Github Actions cannot update a cache, this will unnecessarily"
+                echo "slow down all future builds for this hash, until someone"
+                echo "resets the cache."
+                echo
+                echo
+                echo
+                rm -f "${CACHED_TOOLCHAIN_ARCHIVE}"
+            fi
+        else
+            echo "Cache at ${CACHED_TOOLCHAIN_ARCHIVE} does not exist."
+            echo "Will rebuild toolchain from scratch, and save the result."
+        fi
+        echo "::group::Actually building Toolchain"
+    fi
+popd
+
+
+# === DOWNLOAD AND PATCH ===
 
 pushd "$DIR/Tarballs"
-    md5="$(md5sum binutils-2.32.tar.gz | cut -f1 -d' ')"
+    md5="$($MD5SUM $BINUTILS_PKG | cut -f1 -d' ')"
     echo "bu md5='$md5'"
-    if [ ! -e "binutils-2.32.tar.gz" ] || [ "$md5" != "d1119c93fc0ed3007be4a84dd186af55" ] ; then
-        rm -f binutils-2.32.tar.gz
-        wget "http://ftp.gnu.org/gnu/binutils/binutils-2.32.tar.gz"
+    if [ ! -e $BINUTILS_PKG ] || [ "$md5" != ${BINUTILS_MD5SUM} ] ; then
+        rm -f $BINUTILS_PKG
+        curl -LO "$BINUTILS_BASE_URL/$BINUTILS_PKG"
     else
         echo "Skipped downloading binutils"
     fi
 
-    md5="$(md5sum gcc-8.3.0.tar.gz | cut -f1 -d' ')"
+    md5="$($MD5SUM ${GCC_PKG} | cut -f1 -d' ')"
     echo "gc md5='$md5'"
-    if [ ! -e "gcc-8.3.0.tar.gz" ] || [ "$md5" != "9972f8c24c02ebcb5a342c1b30de69ff" ] ; then
-        rm -f gcc-8.3.0.tar.gz
-        wget "http://ftp.gnu.org/gnu/gcc/gcc-8.3.0/gcc-8.3.0.tar.gz"
+    if [ ! -e $GCC_PKG ] || [ "$md5" != ${GCC_MD5SUM} ] ; then
+        rm -f $GCC_PKG
+        curl -LO "$GCC_BASE_URL/$GCC_NAME/$GCC_PKG"
     else
         echo "Skipped downloading gcc"
     fi
 
-    if [ ! -d "binutils-2.32" ]; then
+    if [ ! -d ${BINUTILS_NAME} ]; then
         echo "Extracting binutils..."
-        tar -xf "binutils-2.32.tar.gz"
+        tar -xzf ${BINUTILS_PKG}
 
-        pushd "binutils-2.32"
-            patch -p1 < $DIR/Patches/binutils.patch > /dev/null
+        pushd ${BINUTILS_NAME}
+            if [ "$git_patch" = "1" ]; then
+                git init > /dev/null
+                git add . > /dev/null
+                git commit -am "BASE" > /dev/null
+                git apply "$DIR"/Patches/binutils.patch > /dev/null
+            else
+                patch -p1 < "$DIR"/Patches/binutils.patch > /dev/null
+            fi
         popd
     else
         echo "Skipped extracting binutils"
     fi
 
-    if [ ! -d "gcc-8.3.0" ]; then
+    if [ ! -d $GCC_NAME ]; then
         echo "Extracting gcc..."
-        tar -xf "gcc-8.3.0.tar.gz"
-
-        pushd "gcc-8.3.0"
-            patch -p1 < $DIR/Patches/gcc.patch > /dev/null
+        tar -xzf $GCC_PKG
+        pushd $GCC_NAME
+            if [ "$git_patch" = "1" ]; then
+                git init > /dev/null
+                git add . > /dev/null
+                git commit -am "BASE" > /dev/null
+                git apply "$DIR"/Patches/gcc.patch > /dev/null
+            else
+                patch -p1 < "$DIR/Patches/gcc.patch" > /dev/null
+            fi
         popd
     else
         echo "Skipped extracting gcc"
     fi
+
+    if [ "$(uname)" = "Darwin" ]; then
+        pushd "gcc-${GCC_VERSION}"
+        ./contrib/download_prerequisites
+        popd
+    fi
+
 popd
 
-mkdir -p $PREFIX
 
-mkdir -p "$DIR/Build/binutils"
-mkdir -p "$DIR/Build/gcc"
+# === COMPILE AND INSTALL ===
+
+mkdir -p "$PREFIX"
+mkdir -p "$DIR/Build/$ARCH/binutils"
+mkdir -p "$DIR/Build/$ARCH/gcc"
 
 if [ -z "$MAKEJOBS" ]; then
-    MAKEJOBS=$(nproc)
+    MAKEJOBS=$($NPROC)
 fi
 
-pushd "$DIR/Build/"
+pushd "$DIR/Build/$ARCH"
     unset PKG_CONFIG_LIBDIR # Just in case
 
     pushd binutils
-        $DIR/Tarballs/binutils-2.32/configure --prefix=$PREFIX \
-                                              --target=$TARGET \
-                                              --with-sysroot=$SYSROOT \
-                                              --disable-nls || exit 1
-        make -j $MAKEJOBS || exit 1
-        make install || exit 1
+        echo "XXX configure binutils"
+        "$DIR"/Tarballs/$BINUTILS_NAME/configure --prefix="$PREFIX" \
+                                                 --target="$TARGET" \
+                                                 --with-sysroot="$SYSROOT" \
+                                                 --enable-shared \
+                                                 --disable-nls \
+                                                 ${TRY_USE_LOCAL_TOOLCHAIN:+"--quiet"} || exit 1
+        if [ "$(uname)" = "Darwin" ]; then
+            # under macOS generated makefiles are not resolving the "intl"
+            # dependency properly to allow linking its own copy of
+            # libintl when building with --enable-shared.
+            "$MAKE" -j "$MAKEJOBS" || true
+            pushd intl
+            "$MAKE" all-yes
+            popd
+        fi
+        echo "XXX build binutils"
+        "$MAKE" -j "$MAKEJOBS" || exit 1
+        "$MAKE" install || exit 1
     popd
 
     pushd gcc
-        $DIR/Tarballs/gcc-8.3.0/configure --prefix=$PREFIX \
-                                          --target=$TARGET \
-                                          --with-sysroot=$SYSROOT \
-                                          --disable-nls \
-                                          --with-newlib \
-                                          --enable-languages=c,c++ || exit 1
+        if [ "$(uname -s)" = "OpenBSD" ]; then
+            perl -pi -e 's/-no-pie/-nopie/g' "$DIR/Tarballs/gcc-$GCC_VERSION/gcc/configure"
+        fi
+
+        echo "XXX configure gcc and libgcc"
+        "$DIR/Tarballs/gcc-$GCC_VERSION/configure" --prefix="$PREFIX" \
+                                            --target="$TARGET" \
+                                            --with-sysroot="$SYSROOT" \
+                                            --disable-nls \
+                                            --with-newlib \
+                                            --enable-shared \
+                                            --enable-languages=c,c++ \
+                                            --enable-default-pie \
+                                            ${TRY_USE_LOCAL_TOOLCHAIN:+"--quiet"} || exit 1
 
         echo "XXX build gcc and libgcc"
-        make -j $MAKEJOBS all-gcc all-target-libgcc || exit 1
+        "$MAKE" -j "$MAKEJOBS" all-gcc all-target-libgcc || exit 1
         echo "XXX install gcc and libgcc"
-        make install-gcc install-target-libgcc || exit 1
+        "$MAKE" install-gcc install-target-libgcc || exit 1
 
-        echo "XXX serenity libc and libm"
-        make -C "$DIR/../LibC/" install
-        make -C "$DIR/../LibM/" install
+        echo "XXX serenity libc and libm headers"
+        mkdir -p "$BUILD"
+        pushd "$BUILD"
+            mkdir -p Root/usr/include/
+            SRC_ROOT=$(realpath "$DIR"/..)
+            FILES=$(find "$SRC_ROOT"/Userland/Libraries/LibC "$SRC_ROOT"/Userland/Libraries/LibM -name '*.h' -print)
+            for header in $FILES; do
+                target=$(echo "$header" | sed -e "s@$SRC_ROOT/Userland/Libraries/LibC@@" -e "s@$SRC_ROOT/Userland/Libraries/LibM@@")
+                $INSTALL -D "$header" "Root/usr/include/$target"
+            done
+            unset SRC_ROOT
+        popd
 
         echo "XXX build libstdc++"
-        make all-target-libstdc++-v3 || exit 1 
+        "$MAKE" -j "$MAKEJOBS" all-target-libstdc++-v3 || exit 1
         echo "XXX install libstdc++"
-        make install-target-libstdc++-v3 || exit 1
+        "$MAKE" install-target-libstdc++-v3 || exit 1
+
+        if [ "$(uname -s)" = "OpenBSD" ]; then
+            cd "$DIR/Local/libexec/gcc/$TARGET/$GCC_VERSION" && ln -sf liblto_plugin.so.0.0 liblto_plugin.so
+        fi
+
     popd
 popd
 
+
+# == SAVE TO CACHE ==
+
+pushd "$DIR"
+    if [ "${TRY_USE_LOCAL_TOOLCHAIN}" = "y" ] ; then
+        echo "::endgroup::"
+        echo "Building cache tar:"
+
+        rm -f "${CACHED_TOOLCHAIN_ARCHIVE}"  # Just in case
+
+        # Stripping doesn't seem to work on macOS.
+        # However, this doesn't seem to be necessary on macOS, the uncompressed size is already about 210 MiB.
+        if [ "$(uname)" != "Darwin" ]; then
+            # We *most definitely* don't need debug symbols in the linker/compiler.
+            # This cuts the uncompressed size from 1.2 GiB per Toolchain down to about 190 MiB.
+            echo "Stripping executables ..."
+            echo "Before: $(du -sh Local)"
+            find Local/ -type f -executable ! -name '*.la' ! -name '*.sh' ! -name 'mk*' -exec strip {} +
+            echo "After: $(du -sh Local)"
+        fi
+        tar czf "${CACHED_TOOLCHAIN_ARCHIVE}" Local/
+
+        echo "Cache (after):"
+        ls -l Cache
+    fi
+popd

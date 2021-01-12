@@ -1,0 +1,4 @@
+[App]
+Name=PixelPaint
+Executable=/bin/PixelPaint
+Category=Graphics

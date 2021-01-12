@@ -1,40 +1,48 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #pragma once
 
 // Device is the base class of everything that lives in the /dev directory.
 //
-// All Devices will automatically register with the VFS.
 // To expose a Device to the filesystem, simply pass two unique numbers to the constructor,
 // and then mknod a file in /dev with those numbers.
 //
 // There are two main subclasses:
 //   - BlockDevice (random access)
 //   - CharacterDevice (sequential)
-//
-// The most important functions in Device are:
-//
-// class_name()
-//   - Used in the /proc filesystem to identify the type of Device.
-//
-// read() and write()
-//   - Implement reading and writing.
-//   - Return the number of bytes read/written, OR a negative error code.
-//
-// can_read() and can_write()
-//
-//   - Used to implement blocking I/O, and the select() and poll() syscalls.
-//   - Return true if read() or write() would succeed, respectively.
-//   - Note that can_read() should return true in EOF conditions,
-//     and a subsequent call to read() should return 0.
-//
-// ioctl()
-//
-//   - Optional. If unimplemented, ioctl() on the device will fail with -ENOTTY.
-//   - Can be overridden in subclasses to implement arbitrary functionality.
-//   - Subclasses should take care to validate incoming addresses before dereferencing.
-//
-
-#include <Kernel/File.h>
+#include <AK/DoublyLinkedList.h>
+#include <AK/Function.h>
+#include <AK/HashMap.h>
+#include <Kernel/Devices/AsyncDeviceRequest.h>
+#include <Kernel/FileSystem/File.h>
+#include <Kernel/Lock.h>
 #include <Kernel/UnixTypes.h>
+
+namespace Kernel {
 
 class Device : public File {
 public:
@@ -43,21 +51,52 @@ public:
     unsigned major() const { return m_major; }
     unsigned minor() const { return m_minor; }
 
-    virtual String absolute_path(FileDescriptor&) const override;
+    virtual String absolute_path(const FileDescription&) const override;
+    virtual String absolute_path() const;
 
     uid_t uid() const { return m_uid; }
     uid_t gid() const { return m_gid; }
 
+    virtual mode_t required_mode() const = 0;
+
     virtual bool is_device() const override { return true; }
+    virtual bool is_disk_device() const { return false; }
+
+    static void for_each(Function<void(Device&)>);
+    static Device* get_device(unsigned major, unsigned minor);
+
+    void process_next_queued_request(Badge<AsyncDeviceRequest>, const AsyncDeviceRequest&);
+
+    template<typename AsyncRequestType, typename... Args>
+    NonnullRefPtr<AsyncRequestType> make_request(Args&&... args)
+    {
+        auto request = adopt(*new AsyncRequestType(*this, forward<Args>(args)...));
+        bool was_empty;
+        {
+            ScopedSpinLock lock(m_requests_lock);
+            was_empty = m_requests.is_empty();
+            m_requests.append(request);
+        }
+        if (was_empty)
+            request->do_start({});
+        return request;
+    }
 
 protected:
     Device(unsigned major, unsigned minor);
     void set_uid(uid_t uid) { m_uid = uid; }
     void set_gid(gid_t gid) { m_gid = gid; }
 
+    static HashMap<u32, Device*>& all_devices();
+
 private:
     unsigned m_major { 0 };
     unsigned m_minor { 0 };
     uid_t m_uid { 0 };
     gid_t m_gid { 0 };
+
+    SpinLock<u8> m_requests_lock;
+    DoublyLinkedList<RefPtr<AsyncDeviceRequest>> m_requests;
 };
+
+}

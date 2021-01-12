@@ -1,58 +1,94 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #pragma once
 
-#include <AK/Badge.h>
-#include <AK/Retainable.h>
-#include <AK/Weakable.h>
-#include <AK/RetainPtr.h>
+#include <AK/InlineLinkedList.h>
+#include <AK/RefCounted.h>
+#include <AK/RefPtr.h>
 #include <AK/Vector.h>
-#include <AK/AKString.h>
+#include <AK/Weakable.h>
 #include <Kernel/Lock.h>
-#include <Kernel/PhysicalAddress.h>
-#include <Kernel/UnixTypes.h>
+
+namespace Kernel {
 
 class Inode;
 class PhysicalPage;
 
-class VMObject : public Retainable<VMObject>, public Weakable<VMObject> {
+class VMObject : public RefCounted<VMObject>
+    , public Weakable<VMObject>
+    , public InlineLinkedListNode<VMObject> {
     friend class MemoryManager;
+    friend class Region;
+
 public:
-    static Retained<VMObject> create_file_backed(RetainPtr<Inode>&&);
-    static Retained<VMObject> create_anonymous(size_t);
-    static Retained<VMObject> create_for_physical_range(PhysicalAddress, size_t);
-    Retained<VMObject> clone();
+    virtual ~VMObject();
 
-    ~VMObject();
-    bool is_anonymous() const { return !m_inode; }
+    virtual RefPtr<VMObject> clone() = 0;
 
-    Inode* inode() { return m_inode.ptr(); }
-    const Inode* inode() const { return m_inode.ptr(); }
-    size_t inode_offset() const { return m_inode_offset; }
+    virtual bool is_anonymous() const { return false; }
+    virtual bool is_inode() const { return false; }
+    virtual bool is_shared_inode() const { return false; }
+    virtual bool is_private_inode() const { return false; }
+    virtual bool is_contiguous() const { return false; }
 
-    String name() const { return m_name; }
-    void set_name(const String& name) { m_name = name; }
+    size_t page_count() const { return m_physical_pages.size(); }
+    const Vector<RefPtr<PhysicalPage>>& physical_pages() const { return m_physical_pages; }
+    Vector<RefPtr<PhysicalPage>>& physical_pages() { return m_physical_pages; }
 
-    size_t page_count() const { return m_size / PAGE_SIZE; }
-    const Vector<RetainPtr<PhysicalPage>>& physical_pages() const { return m_physical_pages; }
-    Vector<RetainPtr<PhysicalPage>>& physical_pages() { return m_physical_pages; }
+    size_t size() const { return m_physical_pages.size() * PAGE_SIZE; }
 
-    void inode_contents_changed(Badge<Inode>, off_t, ssize_t, const byte*);
-    void inode_size_changed(Badge<Inode>, size_t old_size, size_t new_size);
+    virtual const char* class_name() const = 0;
 
-    size_t size() const { return m_size; }
+    // For InlineLinkedListNode
+    VMObject* m_next { nullptr };
+    VMObject* m_prev { nullptr };
+
+    ALWAYS_INLINE void ref_region() { m_regions_count++; }
+    ALWAYS_INLINE void unref_region() { m_regions_count--; }
+    ALWAYS_INLINE bool is_shared_by_multiple_regions() const { return m_regions_count > 1; }
+
+protected:
+    explicit VMObject(size_t);
+    explicit VMObject(const VMObject&);
+
+    template<typename Callback>
+    void for_each_region(Callback);
+
+    Vector<RefPtr<PhysicalPage>> m_physical_pages;
+    Lock m_paging_lock { "VMObject" };
+
+    mutable SpinLock<u8> m_lock;
 
 private:
-    VMObject(RetainPtr<Inode>&&);
-    explicit VMObject(VMObject&);
-    explicit VMObject(size_t);
-    VMObject(PhysicalAddress, size_t);
+    VMObject& operator=(const VMObject&) = delete;
+    VMObject& operator=(VMObject&&) = delete;
+    VMObject(VMObject&&) = delete;
 
-    template<typename Callback> void for_each_region(Callback);
-
-    String m_name;
-    bool m_allow_cpu_caching { true };
-    off_t m_inode_offset { 0 };
-    size_t m_size { 0 };
-    RetainPtr<Inode> m_inode;
-    Vector<RetainPtr<PhysicalPage>> m_physical_pages;
-    Lock m_paging_lock { "VMObject" };
+    Atomic<u32, AK::MemoryOrder::memory_order_relaxed> m_regions_count { 0 };
 };
+
+}

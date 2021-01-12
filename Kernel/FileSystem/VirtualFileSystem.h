@@ -1,119 +1,144 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #pragma once
 
-#include <AK/HashMap.h>
-#include <AK/OwnPtr.h>
-#include <AK/RetainPtr.h>
-#include <AK/AKString.h>
-#include <AK/Vector.h>
+#include <AK/Badge.h>
 #include <AK/Function.h>
-#include "InodeIdentifier.h"
-#include "InodeMetadata.h"
-#include "FileSystem.h"
+#include <AK/HashMap.h>
+#include <AK/NonnullOwnPtrVector.h>
+#include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
+#include <AK/String.h>
+#include <Kernel/FileSystem/FileSystem.h>
+#include <Kernel/FileSystem/InodeIdentifier.h>
+#include <Kernel/FileSystem/InodeMetadata.h>
 #include <Kernel/KResult.h>
+#include <Kernel/UnveilNode.h>
 
-#define O_RDONLY 0
-#define O_WRONLY 1
-#define O_RDWR 2
-#define O_CREAT 0100
-#define O_EXCL 0200
-#define O_NOCTTY 0400
-#define O_TRUNC 01000
-#define O_APPEND 02000
-#define O_NONBLOCK 04000
-#define O_DIRECTORY 00200000
-#define O_NOFOLLOW 00400000
-#define O_CLOEXEC 02000000
-#define O_NOFOLLOW_NOERROR 0x4000000
+namespace Kernel {
 
+class Custody;
 class Device;
-class FileDescriptor;
+class FileDescription;
 
-inline constexpr dword encoded_device(unsigned major, unsigned minor)
-{
-    return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
-}
-
-class VFS;
+struct UidAndGid {
+    uid_t uid;
+    gid_t gid;
+};
 
 class VFS {
     AK_MAKE_ETERNAL
 public:
     class Mount {
     public:
-        Mount(InodeIdentifier host, RetainPtr<FS>&&);
+        Mount(FS&, Custody* host_custody, int flags);
+        Mount(Inode& source, Custody& host_custody, int flags);
 
-        InodeIdentifier host() const { return m_host; }
-        InodeIdentifier guest() const { return m_guest; }
+        const Inode* host() const;
+        Inode* host();
+
+        const Inode& guest() const { return *m_guest; }
+        Inode& guest() { return *m_guest; }
 
         const FS& guest_fs() const { return *m_guest_fs; }
 
+        String absolute_path() const;
+
+        int flags() const { return m_flags; }
+        void set_flags(int flags) { m_flags = flags; }
+
     private:
-        InodeIdentifier m_host;
-        InodeIdentifier m_guest;
-        RetainPtr<FS> m_guest_fs;
+        NonnullRefPtr<Inode> m_guest;
+        NonnullRefPtr<FS> m_guest_fs;
+        RefPtr<Custody> m_host_custody;
+        int m_flags;
     };
 
-    [[gnu::pure]] static VFS& the();
+    static void initialize();
+    static VFS& the();
 
     VFS();
     ~VFS();
 
-    bool mount_root(RetainPtr<FS>&&);
-    bool mount(RetainPtr<FS>&&, StringView path);
+    bool mount_root(FS&);
+    KResult mount(FS&, Custody& mount_point, int flags);
+    KResult bind_mount(Custody& source, Custody& mount_point, int flags);
+    KResult remount(Custody& mount_point, int new_flags);
+    KResult unmount(Inode& guest_inode);
 
-    KResultOr<Retained<FileDescriptor>> open(RetainPtr<Device>&&, int options);
-    KResultOr<Retained<FileDescriptor>> open(StringView path, int options, mode_t mode, Inode& base);
-    KResultOr<Retained<FileDescriptor>> create(StringView path, int options, mode_t mode, Inode& base);
-    KResult mkdir(StringView path, mode_t mode, Inode& base);
-    KResult link(StringView old_path, StringView new_path, Inode& base);
-    KResult unlink(StringView path, Inode& base);
-    KResult symlink(StringView target, StringView linkpath, Inode& base);
-    KResult rmdir(StringView path, Inode& base);
-    KResult chmod(StringView path, mode_t, Inode& base);
-    KResult chmod(Inode&, mode_t);
-    KResult chown(StringView path, uid_t, gid_t, Inode& base);
-    KResult access(StringView path, int mode, Inode& base);
-    KResult stat(StringView path, int options, Inode& base, struct stat&);
-    KResult utime(StringView path, Inode& base, time_t atime, time_t mtime);
-    KResult rename(StringView oldpath, StringView newpath, Inode& base);
-    KResult mknod(StringView path, mode_t, dev_t, Inode& base);
-    KResultOr<Retained<Inode>> open_directory(StringView path, Inode& base);
-
-    void register_device(Device&);
-    void unregister_device(Device&);
+    KResultOr<NonnullRefPtr<FileDescription>> open(StringView path, int options, mode_t mode, Custody& base, Optional<UidAndGid> = {});
+    KResultOr<NonnullRefPtr<FileDescription>> create(StringView path, int options, mode_t mode, Custody& parent_custody, Optional<UidAndGid> = {});
+    KResult mkdir(StringView path, mode_t mode, Custody& base);
+    KResult link(StringView old_path, StringView new_path, Custody& base);
+    KResult unlink(StringView path, Custody& base);
+    KResult symlink(StringView target, StringView linkpath, Custody& base);
+    KResult rmdir(StringView path, Custody& base);
+    KResult chmod(StringView path, mode_t, Custody& base);
+    KResult chmod(Custody&, mode_t);
+    KResult chown(StringView path, uid_t, gid_t, Custody& base);
+    KResult chown(Custody&, uid_t, gid_t);
+    KResult access(StringView path, int mode, Custody& base);
+    KResultOr<InodeMetadata> lookup_metadata(StringView path, Custody& base, int options = 0);
+    KResult utime(StringView path, Custody& base, time_t atime, time_t mtime);
+    KResult rename(StringView oldpath, StringView newpath, Custody& base);
+    KResult mknod(StringView path, mode_t, dev_t, Custody& base);
+    KResultOr<NonnullRefPtr<Custody>> open_directory(StringView path, Custody& base);
 
     size_t mount_count() const { return m_mounts.size(); }
     void for_each_mount(Function<void(const Mount&)>) const;
 
-    KResultOr<String> absolute_path(Inode&);
-    KResultOr<String> absolute_path(InodeIdentifier);
-
     InodeIdentifier root_inode_id() const;
-    Inode* root_inode() { return m_root_inode.ptr(); }
-    const Inode* root_inode() const { return m_root_inode.ptr(); }
 
     void sync();
 
-    Device* get_device(unsigned major, unsigned minor);
+    Custody& root_custody();
+    KResultOr<NonnullRefPtr<Custody>> resolve_path(StringView path, Custody& base, RefPtr<Custody>* out_parent = nullptr, int options = 0, int symlink_recursion_level = 0);
+    KResultOr<NonnullRefPtr<Custody>> resolve_path_without_veil(StringView path, Custody& base, RefPtr<Custody>* out_parent = nullptr, int options = 0, int symlink_recursion_level = 0);
 
 private:
-    friend class FileDescriptor;
+    friend class FileDescription;
 
-    RetainPtr<Inode> get_inode(InodeIdentifier);
+    const UnveilNode* find_matching_unveiled_path(StringView path);
+    KResult validate_path_against_process_veil(StringView path, int options);
 
     bool is_vfs_root(InodeIdentifier) const;
 
-    void traverse_directory_inode(Inode&, Function<bool(const FS::DirectoryEntry&)>);
-    InodeIdentifier old_resolve_path(StringView path, InodeIdentifier base, int& error, int options = 0, InodeIdentifier* parent_id = nullptr);
-    KResultOr<InodeIdentifier> resolve_path(StringView path, InodeIdentifier base, int options = 0, InodeIdentifier* parent_id = nullptr);
-    KResultOr<Retained<Inode>> resolve_path_to_inode(StringView path, Inode& base, RetainPtr<Inode>* parent_id = nullptr, int options = 0);
-    KResultOr<InodeIdentifier> resolve_symbolic_link(InodeIdentifier base, Inode& symlink_inode);
+    KResult traverse_directory_inode(Inode&, Function<bool(const FS::DirectoryEntryView&)>);
 
+    Mount* find_mount_for_host(Inode&);
     Mount* find_mount_for_host(InodeIdentifier);
+    Mount* find_mount_for_guest(Inode&);
     Mount* find_mount_for_guest(InodeIdentifier);
 
-    RetainPtr<Inode> m_root_inode;
-    Vector<OwnPtr<Mount>> m_mounts;
-    HashMap<dword, Device*> m_devices;
+    Lock m_lock { "VFSLock" };
+
+    RefPtr<Inode> m_root_inode;
+    Vector<Mount, 16> m_mounts;
+    RefPtr<Custody> m_root_custody;
 };
 
+}

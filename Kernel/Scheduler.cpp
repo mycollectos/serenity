@@ -1,456 +1,540 @@
-#include "Scheduler.h"
-#include "Process.h"
-#include "RTC.h"
-#include "i8253.h"
+/*
+ * Copyright (c) 2018-2021, Andreas Kling <kling@serenityos.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <AK/QuickSort.h>
+#include <AK/ScopeGuard.h>
 #include <AK/TemporaryChange.h>
-#include <Kernel/Alarm.h>
-#include <Kernel/FileSystem/FileDescriptor.h>
-#include <Kernel/Devices/PCSpeaker.h>
+#include <AK/Time.h>
+#include <Kernel/PerformanceEventBuffer.h>
+#include <Kernel/Process.h>
+#include <Kernel/RTC.h>
+#include <Kernel/Scheduler.h>
+#include <Kernel/Time/TimeManagement.h>
+#include <Kernel/TimerQueue.h>
 
 //#define LOG_EVERY_CONTEXT_SWITCH
 //#define SCHEDULER_DEBUG
+//#define SCHEDULER_RUNNABLE_DEBUG
 
-static dword time_slice_for(Process::Priority priority)
-{
-    // One time slice unit == 1ms
-    switch (priority) {
-    case Process::HighPriority:
-        return 50;
-    case Process::NormalPriority:
-        return 15;
-    case Process::LowPriority:
-        return 5;
-    case Process::IdlePriority:
-        return 1;
-    }
-    ASSERT_NOT_REACHED();
-}
+namespace Kernel {
 
-Thread* current;
-Thread* g_last_fpu_thread;
-Thread* g_finalizer;
-static Process* s_colonel_process;
-qword g_uptime;
-static qword s_beep_timeout;
+class SchedulerPerProcessorData {
+    AK_MAKE_NONCOPYABLE(SchedulerPerProcessorData);
+    AK_MAKE_NONMOVABLE(SchedulerPerProcessorData);
 
-struct TaskRedirectionData {
-    word selector;
-    TSS32 tss;
+public:
+    SchedulerPerProcessorData() = default;
+
+    WeakPtr<Thread> m_pending_beneficiary;
+    const char* m_pending_donate_reason { nullptr };
+    bool m_in_scheduler { true };
 };
-static TaskRedirectionData s_redirection;
-static bool s_active;
 
-bool Scheduler::is_active()
+SchedulerData* g_scheduler_data;
+RecursiveSpinLock g_scheduler_lock;
+
+void Scheduler::init_thread(Thread& thread)
 {
-    return s_active;
+    ASSERT(g_scheduler_data);
+    g_scheduler_data->m_nonrunnable_threads.append(thread);
 }
 
-void Scheduler::beep()
+static u32 time_slice_for(const Thread& thread)
 {
-    PCSpeaker::tone_on(440);
-    s_beep_timeout = g_uptime + 100;
+    // One time slice unit == 4ms (assuming 250 ticks/second)
+    if (&thread == Processor::current().idle_thread())
+        return 1;
+    return 2;
+}
+
+Thread* g_finalizer;
+WaitQueue* g_finalizer_wait_queue;
+Atomic<bool> g_finalizer_has_work { false };
+static Process* s_colonel_process;
+
+void Scheduler::start()
+{
+    ASSERT_INTERRUPTS_DISABLED();
+
+    // We need to acquire our scheduler lock, which will be released
+    // by the idle thread once control transferred there
+    g_scheduler_lock.lock();
+
+    auto& processor = Processor::current();
+    processor.set_scheduler_data(*new SchedulerPerProcessorData());
+    ASSERT(processor.is_initialized());
+    auto& idle_thread = *processor.idle_thread();
+    ASSERT(processor.current_thread() == &idle_thread);
+    ASSERT(processor.idle_thread() == &idle_thread);
+    idle_thread.set_ticks_left(time_slice_for(idle_thread));
+    idle_thread.did_schedule();
+    idle_thread.set_initialized(true);
+    processor.init_context(idle_thread, false);
+    idle_thread.set_state(Thread::Running);
+    ASSERT(idle_thread.affinity() == (1u << processor.id()));
+    processor.initialize_context_switching(idle_thread);
+    ASSERT_NOT_REACHED();
 }
 
 bool Scheduler::pick_next()
 {
     ASSERT_INTERRUPTS_DISABLED();
-    ASSERT(!s_active);
 
-    TemporaryChange<bool> change(s_active, true);
+    auto current_thread = Thread::current();
 
-    ASSERT(s_active);
+    // Set the m_in_scheduler flag before acquiring the spinlock. This
+    // prevents a recursive call into Scheduler::invoke_async upon
+    // leaving the scheduler lock.
+    ScopedCritical critical;
+    auto& scheduler_data = Processor::current().get_scheduler_data();
+    scheduler_data.m_in_scheduler = true;
+    ScopeGuard guard(
+        []() {
+            // We may be on a different processor after we got switched
+            // back to this thread!
+            auto& scheduler_data = Processor::current().get_scheduler_data();
+            ASSERT(scheduler_data.m_in_scheduler);
+            scheduler_data.m_in_scheduler = false;
+        });
 
-    if (!current) {
-        // XXX: The first ever context_switch() goes to the idle process.
-        //      This to setup a reliable place we can return to.
-        return context_switch(s_colonel_process->main_thread());
+    ScopedSpinLock lock(g_scheduler_lock);
+
+    if (current_thread->should_die() && current_thread->state() == Thread::Running) {
+        // Rather than immediately killing threads, yanking the kernel stack
+        // away from them (which can lead to e.g. reference leaks), we always
+        // allow Thread::wait_on to return. This allows the kernel stack to
+        // clean up and eventually we'll get here shortly before transitioning
+        // back to user mode (from Processor::exit_trap). At this point we
+        // no longer want to schedule this thread. We can't wait until
+        // Scheduler::enter_current because we don't want to allow it to
+        // transition back to user mode.
+#ifdef SCHEDULER_DEBUG
+        dbg() << "Scheduler[" << Processor::current().id() << "]: Thread " << *current_thread << " is dying";
+#endif
+        current_thread->set_state(Thread::Dying);
     }
 
-    struct timeval now;
-    kgettimeofday(now);
-    auto now_sec = now.tv_sec;
-    auto now_usec = now.tv_usec;
-
-    // Check and unblock threads whose wait conditions have been met.
-    Thread::for_each_nonrunnable([&] (Thread& thread) {
-        auto& process = thread.process();
-
-        if (thread.state() == Thread::BlockedSleep) {
-            if (thread.wakeup_time() <= g_uptime)
-                thread.unblock();
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedWait) {
-            process.for_each_child([&] (Process& child) {
-                if (!child.is_dead())
-                    return true;
-                if (thread.waitee_pid() == -1 || thread.waitee_pid() == child.pid()) {
-                    thread.m_waitee_pid = child.pid();
-                    thread.unblock();
-                    return false;
-                }
-                return true;
-            });
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedRead) {
-            ASSERT(thread.m_blocked_descriptor);
-            // FIXME: Block until the amount of data wanted is available.
-            if (thread.m_blocked_descriptor->can_read())
-                thread.unblock();
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedWrite) {
-            ASSERT(thread.m_blocked_descriptor != -1);
-            if (thread.m_blocked_descriptor->can_write())
-                thread.unblock();
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedConnect) {
-            auto& descriptor = *thread.m_blocked_descriptor;
-            auto& socket = *descriptor.socket();
-            if (socket.is_connected())
-                thread.unblock();
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedReceive) {
-            auto& descriptor = *thread.m_blocked_descriptor;
-            auto& socket = *descriptor.socket();
-            // FIXME: Block until the amount of data wanted is available.
-            bool timed_out = now_sec > socket.receive_deadline().tv_sec || (now_sec == socket.receive_deadline().tv_sec && now_usec >= socket.receive_deadline().tv_usec);
-            if (timed_out || descriptor.can_read()) {
-                thread.unblock();
-                return IterationDecision::Continue;
-            }
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedSelect) {
-            if (thread.m_select_has_timeout) {
-                if (now_sec > thread.m_select_timeout.tv_sec || (now_sec == thread.m_select_timeout.tv_sec && now_usec >= thread.m_select_timeout.tv_usec)) {
-                    thread.unblock();
-                    return IterationDecision::Continue;
-                }
-            }
-            for (int fd : thread.m_select_read_fds) {
-                if (process.m_fds[fd].descriptor->can_read()) {
-                    thread.unblock();
-                    return IterationDecision::Continue;
-                }
-            }
-            for (int fd : thread.m_select_write_fds) {
-                if (process.m_fds[fd].descriptor->can_write()) {
-                    thread.unblock();
-                    return IterationDecision::Continue;
-                }
-            }
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::BlockedSnoozing) {
-            if (thread.m_snoozing_alarm->is_ringing()) {
-                thread.m_snoozing_alarm = nullptr;
-                thread.unblock();
-            }
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::Skip1SchedulerPass) {
-            thread.set_state(Thread::Skip0SchedulerPasses);
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::Skip0SchedulerPasses) {
-            thread.set_state(Thread::Runnable);
-            return IterationDecision::Continue;
-        }
-
-        if (thread.state() == Thread::Dying) {
-            ASSERT(g_finalizer);
-            if (g_finalizer->state() == Thread::BlockedLurking)
-                g_finalizer->unblock();
-            return IterationDecision::Continue;
-        }
-
+#ifdef SCHEDULER_RUNNABLE_DEBUG
+    dbg() << "Scheduler[" << Processor::current().id() << "]: Non-runnables:";
+    Scheduler::for_each_nonrunnable([&](Thread& thread) -> IterationDecision {
+        if (thread.state() == Thread::Dying)
+            dbg() << "  " << String::format("%-12s", thread.state_string()) << " " << thread << " @ " << String::formatted("{:04x}:{:08x}", thread.tss().cs, thread.tss().eip) << " Finalizable: " << thread.is_finalizable();
+        else
+            dbg() << "  " << String::format("%-12s", thread.state_string()) << " " << thread << " @ " << String::formatted("{:04x}:{:08x}", thread.tss().cs, thread.tss().eip);
         return IterationDecision::Continue;
     });
 
-    Process::for_each([&] (Process& process) {
-        if (process.is_dead()) {
-            if (current != &process.main_thread() && (!process.ppid() || !Process::from_pid(process.ppid()))) {
-                auto name = process.name();
-                auto pid = process.pid();
-                auto exit_status = Process::reap(process);
-                dbgprintf("reaped unparented process %s(%u), exit status: %u\n", name.characters(), pid, exit_status);
-            }
+    dbg() << "Scheduler[" << Processor::current().id() << "]: Runnables:";
+    Scheduler::for_each_runnable([](Thread& thread) -> IterationDecision {
+        dbg() << "  " << String::format("%3u", thread.effective_priority()) << "/" << String::format("%2u", thread.priority()) << " " << String::format("%-12s", thread.state_string()) << " " << thread << " @ " << String::formatted("{:04x}:{:08x}", thread.tss().cs, thread.tss().eip);
+        return IterationDecision::Continue;
+    });
+#endif
+
+    Thread* thread_to_schedule = nullptr;
+
+    auto pending_beneficiary = scheduler_data.m_pending_beneficiary.strong_ref();
+    Vector<Thread*, 128> sorted_runnables;
+    for_each_runnable([&](auto& thread) {
+        if ((thread.affinity() & (1u << Processor::current().id())) == 0)
+            return IterationDecision::Continue;
+        if (thread.state() == Thread::Running && &thread != current_thread)
+            return IterationDecision::Continue;
+        sorted_runnables.append(&thread);
+        if (&thread == pending_beneficiary) {
+            thread_to_schedule = &thread;
+            return IterationDecision::Break;
         }
-        return true;
+        return IterationDecision::Continue;
     });
 
-    // Dispatch any pending signals.
-    // FIXME: Do we really need this to be a separate pass over the process list?
-    Thread::for_each_living([] (Thread& thread) {
-        if (!thread.has_unmasked_pending_signals())
-            return true;
-        // FIXME: It would be nice if the Scheduler didn't have to worry about who is "current"
-        //        For now, avoid dispatching signals to "current" and do it in a scheduling pass
-        //        while some other process is interrupted. Otherwise a mess will be made.
-        if (&thread == current)
-            return true;
-        // We know how to interrupt blocked processes, but if they are just executing
-        // at some random point in the kernel, let them continue. They'll be in userspace
-        // sooner or later and we can deliver the signal then.
-        // FIXME: Maybe we could check when returning from a syscall if there's a pending
-        //        signal and dispatch it then and there? Would that be doable without the
-        //        syscall effectively being "interrupted" despite having completed?
-        if (thread.in_kernel() && !thread.is_blocked() && !thread.is_stopped())
-            return true;
-        // NOTE: dispatch_one_pending_signal() may unblock the process.
-        bool was_blocked = thread.is_blocked();
-        if (thread.dispatch_one_pending_signal() == ShouldUnblockThread::No)
-            return true;
-        if (was_blocked) {
-            dbgprintf("Unblock %s(%u) due to signal\n", thread.process().name().characters(), thread.pid());
-            thread.m_was_interrupted_while_blocked = true;
-            thread.unblock();
-        }
-        return true;
-    });
+    if (thread_to_schedule) {
+        // The thread we're supposed to donate to still exists
+        const char* reason = scheduler_data.m_pending_donate_reason;
+        scheduler_data.m_pending_beneficiary = nullptr;
+        scheduler_data.m_pending_donate_reason = nullptr;
+
+        // We need to leave our first critical section before switching context,
+        // but since we're still holding the scheduler lock we're still in a critical section
+        critical.leave();
 
 #ifdef SCHEDULER_DEBUG
-    dbgprintf("Non-runnables:\n");
-    for (auto* thread = g_nonrunnable_threads->head(); thread; thread = thread->next()) {
-        auto* process = &thread->process();
-        dbgprintf("[K%x] % 12s %s(%u:%u) @ %w:%x\n", process, to_string(thread->state()), process->name().characters(), process->pid(), thread->tid(), thread->tss().cs, thread->tss().eip);
+        dbg() << "Processing pending donate to " << *thread_to_schedule << " reason=" << reason;
+#endif
+        return donate_to_and_switch(thread_to_schedule, reason);
     }
 
-    dbgprintf("Runnables:\n");
-    for (auto* thread = g_runnable_threads->head(); thread; thread = thread->next()) {
-        auto* process = &thread->process();
-        dbgprintf("[K%x] % 12s %s(%u:%u) @ %w:%x\n", process, to_string(thread->state()), process->name().characters(), process->pid(), thread->tid(), thread->tss().cs, thread->tss().eip);
-    }
-#endif
+    // Either we're not donating or the beneficiary disappeared.
+    // Either way clear any pending information
+    scheduler_data.m_pending_beneficiary = nullptr;
+    scheduler_data.m_pending_donate_reason = nullptr;
 
-    if (g_runnable_threads->is_empty())
-        return context_switch(s_colonel_process->main_thread());
+    quick_sort(sorted_runnables, [](auto& a, auto& b) { return a->effective_priority() >= b->effective_priority(); });
 
-    auto* previous_head = g_runnable_threads->head();
-    for (;;) {
-        // Move head to tail.
-        g_runnable_threads->append(g_runnable_threads->remove_head());
-        auto* thread = g_runnable_threads->head();
+    for (auto* thread : sorted_runnables) {
+        if (thread->process().exec_tid() && thread->process().exec_tid() != thread->tid())
+            continue;
 
-        if (!thread->process().is_being_inspected() && (thread->state() == Thread::Runnable || thread->state() == Thread::Running)) {
-#ifdef SCHEDULER_DEBUG
-            kprintf("switch to %s(%u:%u) @ %w:%x\n", thread->process().name().characters(), thread->process().pid(), thread->tid(), thread->tss().cs, thread->tss().eip);
-#endif
-            return context_switch(*thread);
-        }
+        ASSERT(thread->state() == Thread::Runnable || thread->state() == Thread::Running);
 
-        if (thread == previous_head) {
-            // Back at process_head, nothing wants to run. Send in the colonel!
-            return context_switch(s_colonel_process->main_thread());
+        if (!thread_to_schedule) {
+            thread->m_extra_priority = 0;
+            thread_to_schedule = thread;
+        } else {
+            thread->m_extra_priority++;
         }
     }
-}
 
-bool Scheduler::donate_to(Thread* beneficiary, const char* reason)
-{
-    InterruptDisabler disabler;
-    if (!Thread::is_thread(beneficiary))
-        return false;
+    if (!thread_to_schedule)
+        thread_to_schedule = Processor::current().idle_thread();
 
-    (void)reason;
-    unsigned ticks_left = current->ticks_left();
-    if (!beneficiary || beneficiary->state() != Thread::Runnable || ticks_left <= 1)
-        return yield();
-
-    unsigned ticks_to_donate = min(ticks_left - 1, time_slice_for(beneficiary->process().priority()));
 #ifdef SCHEDULER_DEBUG
-    dbgprintf("%s(%u:%u) donating %u ticks to %s(%u:%u), reason=%s\n", current->process().name().characters(), current->pid(), current->tid(), ticks_to_donate, beneficiary->process().name().characters(), beneficiary->pid(), beneficiary->tid(), reason);
+    dbg() << "Scheduler[" << Processor::current().id() << "]: Switch to " << *thread_to_schedule << " @ " << String::format("%04x:%08x", thread_to_schedule->tss().cs, thread_to_schedule->tss().eip);
 #endif
-    context_switch(*beneficiary);
-    beneficiary->set_ticks_left(ticks_to_donate);
-    switch_now();
-    return false;
+
+    // We need to leave our first critical section before switching context,
+    // but since we're still holding the scheduler lock we're still in a critical section
+    critical.leave();
+
+    thread_to_schedule->set_ticks_left(time_slice_for(*thread_to_schedule));
+    return context_switch(thread_to_schedule);
 }
 
 bool Scheduler::yield()
 {
     InterruptDisabler disabler;
-    ASSERT(current);
-//    dbgprintf("%s(%u:%u) yield()\n", current->process().name().characters(), current->pid(), current->tid());
+    auto& proc = Processor::current();
+    auto& scheduler_data = proc.get_scheduler_data();
 
-    if (!pick_next())
+    // Clear any pending beneficiary
+    scheduler_data.m_pending_beneficiary = nullptr;
+    scheduler_data.m_pending_donate_reason = nullptr;
+
+    auto current_thread = Thread::current();
+#ifdef SCHEDULER_DEBUG
+    dbg() << "Scheduler[" << proc.id() << "]: yielding thread " << *current_thread << " in_irq: " << proc.in_irq();
+#endif
+    ASSERT(current_thread != nullptr);
+    if (proc.in_irq() || proc.in_critical()) {
+        // If we're handling an IRQ we can't switch context, or we're in
+        // a critical section where we don't want to switch contexts, then
+        // delay until exiting the trap or critical section
+        proc.invoke_scheduler_async();
         return false;
+    }
 
-//    dbgprintf("yield() jumping to new process: sel=%x, %s(%u:%u)\n", current->far_ptr().selector, current->process().name().characters(), current->pid(), current->tid());
-    switch_now();
+    if (!Scheduler::pick_next())
+        return false;
+#ifdef SCHEDULER_DEBUG
+    dbg() << "Scheduler[" << Processor::current().id() << "]: yield returns to thread " << *current_thread << " in_irq: " << Processor::current().in_irq();
+#endif
     return true;
 }
 
-void Scheduler::pick_next_and_switch_now()
+bool Scheduler::donate_to_and_switch(Thread* beneficiary, [[maybe_unused]] const char* reason)
 {
-    bool someone_wants_to_run = pick_next();
-    ASSERT(someone_wants_to_run);
-    switch_now();
+    ASSERT(g_scheduler_lock.own_lock());
+
+    auto& proc = Processor::current();
+    ASSERT(proc.in_critical() == 1);
+
+    unsigned ticks_left = Thread::current()->ticks_left();
+    if (!beneficiary || beneficiary->state() != Thread::Runnable || ticks_left <= 1)
+        return Scheduler::yield();
+
+    unsigned ticks_to_donate = min(ticks_left - 1, time_slice_for(*beneficiary));
+#ifdef SCHEDULER_DEBUG
+    dbg() << "Scheduler[" << proc.id() << "]: Donating " << ticks_to_donate << " ticks to " << *beneficiary << ", reason=" << reason;
+#endif
+    beneficiary->set_ticks_left(ticks_to_donate);
+
+    return Scheduler::context_switch(beneficiary);
 }
 
-void Scheduler::switch_now()
+bool Scheduler::donate_to(RefPtr<Thread>& beneficiary, const char* reason)
 {
-    Descriptor& descriptor = get_gdt_entry(current->selector());
-    descriptor.type = 9;
-    flush_gdt();
-    asm("sti\n"
-        "ljmp *(%%eax)\n"
-        ::"a"(&current->far_ptr())
-    );
+    ASSERT(beneficiary);
+
+    if (beneficiary == Thread::current())
+        return Scheduler::yield();
+
+    // Set the m_in_scheduler flag before acquiring the spinlock. This
+    // prevents a recursive call into Scheduler::invoke_async upon
+    // leaving the scheduler lock.
+    ScopedCritical critical;
+    auto& proc = Processor::current();
+    auto& scheduler_data = proc.get_scheduler_data();
+    scheduler_data.m_in_scheduler = true;
+    ScopeGuard guard(
+        []() {
+            // We may be on a different processor after we got switched
+            // back to this thread!
+            auto& scheduler_data = Processor::current().get_scheduler_data();
+            ASSERT(scheduler_data.m_in_scheduler);
+            scheduler_data.m_in_scheduler = false;
+        });
+
+    ASSERT(!proc.in_irq());
+
+    if (proc.in_critical() > 1) {
+        scheduler_data.m_pending_beneficiary = beneficiary; // Save the beneficiary
+        scheduler_data.m_pending_donate_reason = reason;
+        proc.invoke_scheduler_async();
+        return false;
+    }
+
+    ScopedSpinLock lock(g_scheduler_lock);
+
+    // "Leave" the critical section before switching context. Since we
+    // still hold the scheduler lock, we're not actually leaving it.
+    // Processor::switch_context expects Processor::in_critical() to be 1
+    critical.leave();
+    donate_to_and_switch(beneficiary, reason);
+    return false;
 }
 
-bool Scheduler::context_switch(Thread& thread)
+bool Scheduler::context_switch(Thread* thread)
 {
-    thread.set_ticks_left(time_slice_for(thread.process().priority()));
-    thread.did_schedule();
+    thread->did_schedule();
 
-    if (current == &thread)
+    auto from_thread = Thread::current();
+    if (from_thread == thread)
         return false;
 
-    if (current) {
+    if (from_thread) {
         // If the last process hasn't blocked (still marked as running),
         // mark it as runnable for the next round.
-        if (current->state() == Thread::Running)
-            current->set_state(Thread::Runnable);
+        if (from_thread->state() == Thread::Running)
+            from_thread->set_state(Thread::Runnable);
 
 #ifdef LOG_EVERY_CONTEXT_SWITCH
-        dbgprintf("Scheduler: %s(%u:%u) -> %s(%u:%u) %w:%x\n",
-                  current->process().name().characters(), current->process().pid(), current->tid(),
-                  thread.process().name().characters(), thread.process().pid(), thread.tid(),
-                  thread.tss().cs, thread.tss().eip);
+        dbgln("Scheduler[{}]: {} -> {} [prio={}] {:04x}:{:08x}", Processor::current().id(), from_thread->tid().value(), thread->tid().value(), thread->priority(), thread->tss().cs, thread->tss().eip);
 #endif
     }
 
-    current = &thread;
-    thread.set_state(Thread::Running);
-
-    if (!thread.selector()) {
-        thread.set_selector(gdt_alloc_entry());
-        auto& descriptor = get_gdt_entry(thread.selector());
-        descriptor.set_base(&thread.tss());
-        descriptor.set_limit(0xffff);
-        descriptor.dpl = 0;
-        descriptor.segment_present = 1;
-        descriptor.granularity = 1;
-        descriptor.zero = 0;
-        descriptor.operation_size = 1;
-        descriptor.descriptor_type = 0;
+    auto& proc = Processor::current();
+    if (!thread->is_initialized()) {
+        proc.init_context(*thread, false);
+        thread->set_initialized(true);
     }
+    thread->set_state(Thread::Running);
 
-    auto& descriptor = get_gdt_entry(thread.selector());
-    descriptor.type = 11; // Busy TSS
-    flush_gdt();
+    // Mark it as active because we are using this thread. This is similar
+    // to comparing it with Processor::current_thread, but when there are
+    // multiple processors there's no easy way to check whether the thread
+    // is actually still needed. This prevents accidental finalization when
+    // a thread is no longer in Running state, but running on another core.
+    thread->set_active(true);
+
+    proc.switch_context(from_thread, thread);
+
+    // NOTE: from_thread at this point reflects the thread we were
+    // switched from, and thread reflects Thread::current()
+    enter_current(*from_thread, false);
+    ASSERT(thread == Thread::current());
+
+#if ARCH(I386)
+    auto iopl = get_iopl_from_eflags(Thread::current()->get_register_dump_from_stack().eflags);
+    if (thread->process().is_user_process() && iopl != 0) {
+        dbgln("PANIC: Switched to thread {} with non-zero IOPL={}", Thread::current()->tid().value(), iopl);
+        Processor::halt();
+    }
+#endif
+
     return true;
 }
 
-static void initialize_redirection()
+void Scheduler::enter_current(Thread& prev_thread, bool is_first)
 {
-    auto& descriptor = get_gdt_entry(s_redirection.selector);
-    descriptor.set_base(&s_redirection.tss);
-    descriptor.set_limit(0xffff);
-    descriptor.dpl = 0;
-    descriptor.segment_present = 1;
-    descriptor.granularity = 1;
-    descriptor.zero = 0;
-    descriptor.operation_size = 1;
-    descriptor.descriptor_type = 0;
-    descriptor.type = 9;
-    flush_gdt();
+    ASSERT(g_scheduler_lock.own_lock());
+    prev_thread.set_active(false);
+    if (prev_thread.state() == Thread::Dying) {
+        // If the thread we switched from is marked as dying, then notify
+        // the finalizer. Note that as soon as we leave the scheduler lock
+        // the finalizer may free from_thread!
+        notify_finalizer();
+    } else if (!is_first) {
+        // Check if we have any signals we should deliver (even if we don't
+        // end up switching to another thread).
+        auto current_thread = Thread::current();
+        if (!current_thread->is_in_block()) {
+            ScopedSpinLock lock(current_thread->get_lock());
+            if (current_thread->state() == Thread::Running && current_thread->pending_signals_for_state()) {
+                current_thread->dispatch_one_pending_signal();
+            }
+        }
+    }
 }
 
-void Scheduler::prepare_for_iret_to_new_process()
+void Scheduler::leave_on_first_switch(u32 flags)
 {
-    auto& descriptor = get_gdt_entry(s_redirection.selector);
-    descriptor.type = 9;
-    s_redirection.tss.backlink = current->selector();
-    load_task_register(s_redirection.selector);
+    // This is called when a thread is switched into for the first time.
+    // At this point, enter_current has already be called, but because
+    // Scheduler::context_switch is not in the call stack we need to
+    // clean up and release locks manually here
+    g_scheduler_lock.unlock(flags);
+    auto& scheduler_data = Processor::current().get_scheduler_data();
+    ASSERT(scheduler_data.m_in_scheduler);
+    scheduler_data.m_in_scheduler = false;
 }
 
-void Scheduler::prepare_to_modify_tss(Thread& thread)
+void Scheduler::prepare_after_exec()
 {
-    // This ensures that a currently running process modifying its own TSS
-    // in order to yield() and end up somewhere else doesn't just end up
-    // right after the yield().
-    if (current == &thread)
-        load_task_register(s_redirection.selector);
+    // This is called after exec() when doing a context "switch" into
+    // the new process. This is called from Processor::assume_context
+    ASSERT(g_scheduler_lock.own_lock());
+    auto& scheduler_data = Processor::current().get_scheduler_data();
+    ASSERT(!scheduler_data.m_in_scheduler);
+    scheduler_data.m_in_scheduler = true;
+}
+
+void Scheduler::prepare_for_idle_loop()
+{
+    // This is called when the CPU finished setting up the idle loop
+    // and is about to run it. We need to acquire he scheduler lock
+    ASSERT(!g_scheduler_lock.own_lock());
+    g_scheduler_lock.lock();
+    auto& scheduler_data = Processor::current().get_scheduler_data();
+    ASSERT(!scheduler_data.m_in_scheduler);
+    scheduler_data.m_in_scheduler = true;
 }
 
 Process* Scheduler::colonel()
 {
+    ASSERT(s_colonel_process);
     return s_colonel_process;
 }
 
 void Scheduler::initialize()
 {
-    s_redirection.selector = gdt_alloc_entry();
-    initialize_redirection();
-    s_colonel_process = Process::create_kernel_process("colonel", nullptr);
-    // Make sure the colonel uses a smallish time slice.
-    s_colonel_process->set_priority(Process::IdlePriority);
-    load_task_register(s_redirection.selector);
+    ASSERT(&Processor::current() != nullptr); // sanity check
+
+    RefPtr<Thread> idle_thread;
+    g_scheduler_data = new SchedulerData;
+    g_finalizer_wait_queue = new WaitQueue;
+
+    g_finalizer_has_work.store(false, AK::MemoryOrder::memory_order_release);
+    s_colonel_process = Process::create_kernel_process(idle_thread, "colonel", idle_loop, nullptr, 1).leak_ref();
+    ASSERT(s_colonel_process);
+    ASSERT(idle_thread);
+    idle_thread->set_priority(THREAD_PRIORITY_MIN);
+    idle_thread->set_name(StringView("idle thread #0"));
+
+    set_idle_thread(idle_thread);
 }
 
-void Scheduler::timer_tick(RegisterDump& regs)
+void Scheduler::set_idle_thread(Thread* idle_thread)
 {
-    if (!current)
+    Processor::current().set_idle_thread(*idle_thread);
+    Processor::current().set_current_thread(*idle_thread);
+}
+
+Thread* Scheduler::create_ap_idle_thread(u32 cpu)
+{
+    ASSERT(cpu != 0);
+    // This function is called on the bsp, but creates an idle thread for another AP
+    ASSERT(Processor::current().id() == 0);
+
+    ASSERT(s_colonel_process);
+    Thread* idle_thread = s_colonel_process->create_kernel_thread(idle_loop, nullptr, THREAD_PRIORITY_MIN, String::format("idle thread #%u", cpu), 1 << cpu, false);
+    ASSERT(idle_thread);
+    return idle_thread;
+}
+
+void Scheduler::timer_tick(const RegisterState& regs)
+{
+    ASSERT_INTERRUPTS_DISABLED();
+    ASSERT(Processor::current().in_irq());
+
+    auto current_thread = Processor::current().current_thread();
+    if (!current_thread)
         return;
 
-    ++g_uptime;
-
-    if (s_beep_timeout && g_uptime > s_beep_timeout) {
-        PCSpeaker::tone_off();
-        s_beep_timeout = 0;
+    bool is_bsp = Processor::current().id() == 0;
+    if (!is_bsp)
+        return; // TODO: This prevents scheduling on other CPUs!
+    if (current_thread->process().is_profiling()) {
+        ASSERT(current_thread->process().perf_events());
+        auto& perf_events = *current_thread->process().perf_events();
+        [[maybe_unused]] auto rc = perf_events.append(PERF_EVENT_SAMPLE, 0, 0);
     }
 
-    if (current->tick())
+    if (current_thread->tick((regs.cs & 3) == 0))
         return;
 
-    current->tss().gs = regs.gs;
-    current->tss().fs = regs.fs;
-    current->tss().es = regs.es;
-    current->tss().ds = regs.ds;
-    current->tss().edi = regs.edi;
-    current->tss().esi = regs.esi;
-    current->tss().ebp = regs.ebp;
-    current->tss().ebx = regs.ebx;
-    current->tss().edx = regs.edx;
-    current->tss().ecx = regs.ecx;
-    current->tss().eax = regs.eax;
-    current->tss().eip = regs.eip;
-    current->tss().cs = regs.cs;
-    current->tss().eflags = regs.eflags;
+    ASSERT_INTERRUPTS_DISABLED();
+    ASSERT(Processor::current().in_irq());
+    Processor::current().invoke_scheduler_async();
+}
 
-    // Compute process stack pointer.
-    // Add 12 for CS, EIP, EFLAGS (interrupt mechanic)
-    current->tss().esp = regs.esp + 12;
-    current->tss().ss = regs.ss;
+void Scheduler::invoke_async()
+{
+    ASSERT_INTERRUPTS_DISABLED();
+    auto& proc = Processor::current();
+    ASSERT(!proc.in_irq());
 
-    if ((current->tss().cs & 3) != 0) {
-        current->tss().ss = regs.ss_if_crossRing;
-        current->tss().esp = regs.esp_if_crossRing;
+    // Since this function is called when leaving critical sections (such
+    // as a SpinLock), we need to check if we're not already doing this
+    // to prevent recursion
+    if (!proc.get_scheduler_data().m_in_scheduler)
+        pick_next();
+}
+
+void Scheduler::yield_from_critical()
+{
+    auto& proc = Processor::current();
+    ASSERT(proc.in_critical());
+    ASSERT(!proc.in_irq());
+
+    yield(); // Flag a context switch
+
+    u32 prev_flags;
+    u32 prev_crit = Processor::current().clear_critical(prev_flags, false);
+
+    // Note, we may now be on a different CPU!
+    Processor::current().restore_critical(prev_crit, prev_flags);
+}
+
+void Scheduler::notify_finalizer()
+{
+    if (g_finalizer_has_work.exchange(true, AK::MemoryOrder::memory_order_acq_rel) == false)
+        g_finalizer_wait_queue->wake_all();
+}
+
+void Scheduler::idle_loop(void*)
+{
+    dbgln("Scheduler[{}]: idle loop running", Processor::current().id());
+    ASSERT(are_interrupts_enabled());
+
+    for (;;) {
+        asm("hlt");
+
+        if (Processor::current().id() == 0)
+            yield();
     }
+}
 
-    if (!pick_next())
-        return;
-    prepare_for_iret_to_new_process();
-
-    // Set the NT (nested task) flag.
-    asm(
-        "pushf\n"
-        "orl $0x00004000, (%esp)\n"
-        "popf\n"
-    );
 }

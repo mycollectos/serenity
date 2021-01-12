@@ -1,0 +1,175 @@
+name: Build, lint, and test
+
+on: [push, pull_request]
+
+env:
+  # Don't mix these up!
+  # runner.workspace = /home/runner/work/serenity
+  # github.workspace = /home/runner/work/serenity/serenity
+  SERENITY_ROOT: ${{ github.workspace }}
+
+jobs:
+  build_and_test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-20.04
+            allow-test-failure: false
+            # There sure is a lot of logic here, is there a better way?
+            # TODO: Make IRC notifications its own job/workflow?
+            should-notify-irc: ${{ github.repository == 'SerenityOS/serenity' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')) }}
+          - os: macos-10.15
+            allow-test-failure: true
+            should-notify-irc: false
+
+    steps:
+    - uses: actions/checkout@v2
+    # Set default Python to python 3.x, and set Python path such that pip install works properly
+    - uses: actions/setup-python@v2
+
+    # === OS SETUP ===
+
+    # Do we need to update the package cache first?
+    # sudo apt-get update -qq
+
+    - name: Purge interfering packages
+      # Remove GCC 9 and clang-format 10 (installed by default)
+      run: sudo apt-get purge -y gcc-9 g++-9 libstdc++-9-dev clang-format-10
+      if: ${{ runner.os == 'Linux' }}
+    - name: "Install Ubuntu dependencies"
+      # These packages are already part of the ubuntu-20.04 image:
+      # cmake gcc-10 g++-10 shellcheck libgmp-dev
+      # These aren't:
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-11 main"
+        sudo apt-get update
+        sudo apt-get install clang-format-11 libstdc++-10-dev libmpfr-dev libmpc-dev ninja-build npm
+      # If we ever do any qemu-emulation on Github Actions, we should re-enable this:
+      # e2fsprogs qemu-system-i386 qemu-utils
+      if: ${{ runner.os == 'Linux' }}
+    - name: Use GCC 10 instead
+      run: sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 60 --slave /usr/bin/g++ g++ /usr/bin/g++-10
+      if: ${{ runner.os == 'Linux' }}
+
+    - name: Install macOS dependencies
+      run: brew install coreutils ninja
+      if: ${{ runner.os == 'macOS' }}
+
+    - name: Install JS dependencies
+      run: sudo npm install -g prettier
+    - name: Install Python dependencies
+      # The setup-python action set default python to python3.x. Note that we are not using system python here.
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 requests
+    - name: Check versions
+      run: set +e; g++ --version; g++-10 --version; clang-format --version; clang-format-11 --version; prettier --version; python --version; python3 --version; ninja --version; flake8 --version
+
+    # === PREPARE FOR BUILDING ===
+
+    - name: Lint (Phase 1/2)
+      run: ${{ github.workspace }}/Meta/lint-ci.sh
+      if: ${{ runner.os == 'Linux' }}
+    - name: Toolchain cache
+      uses: actions/cache@v2
+      with:
+        path: ${{ github.workspace }}/Toolchain/Cache/
+        # This assumes that *ALL* LibC headers have an impact on the Toolchain.
+        # This is wrong, and causes more Toolchain rebuilds than necessary.
+        # However, we want to avoid false cache hits at all costs.
+        key: ${{ runner.os }}-toolchain-i686-${{ hashFiles('Userland/Libraries/LibC/**/*.h', 'Toolchain/Patches/*.patch', 'Toolchain/BuildIt.sh') }}
+    - name: Restore or regenerate Toolchain
+      run: TRY_USE_LOCAL_TOOLCHAIN=y ${{ github.workspace }}/Toolchain/BuildIt.sh
+
+    # TODO: ccache
+    # https://cristianadam.eu/20200113/speeding-up-c-plus-plus-github-actions-using-ccache/
+    # https://github.com/cristianadam/HelloWorld/blob/master/.github/workflows/build_cmake.yml
+    - name: Create build environment
+      working-directory: ${{ github.workspace }}
+      # Note that this needs to run *even if* the Toolchain was built,
+      # in order to set options like BUILD_LAGOM.
+      run: |
+        mkdir -p Build
+        cd Build
+        cmake .. -GNinja -DBUILD_LAGOM=ON -DENABLE_ALL_THE_DEBUG_MACROS=ON -DCMAKE_C_COMPILER=gcc-10 -DCMAKE_CXX_COMPILER=g++-10
+
+    # === ACTUALLY BUILD AND TEST ===
+
+    - name: Initialize CodeQL Static Analysis for C++
+      uses: github/codeql-action/init@v1
+      with:
+        languages: cpp
+        config-file: ./.github/codeql/config.yml
+
+    - name: Build Serenity and Tests
+      working-directory: ${{ github.workspace }}/Build
+      run: cmake --build .
+    - name: Lint (Phase 2/2)
+      working-directory: ${{ github.workspace }}/Meta
+      run: ./check-symbols.sh
+    - name: Run CMake tests
+      working-directory: ${{ github.workspace }}/Build
+      run: CTEST_OUTPUT_ON_FAILURE=1 ninja test || ${{ matrix.allow-test-failure }}
+      timeout-minutes: 2
+    - name: Run JS tests
+      working-directory: ${{ github.workspace }}/Build/Meta/Lagom
+      run: DISABLE_DBG_OUTPUT=1 ./test-js || ${{ matrix.allow-test-failure }}
+    - name: Run LibCompress tests
+      working-directory: ${{ github.workspace }}/Build/Meta/Lagom
+      run: ./test-compress
+
+     # Run analysis last, so contributors get lint/test feedback ASAP.
+    - name: Perform post build CodeQL Analysis
+      uses: github/codeql-action/analyze@v1
+
+    # === NOTIFICATIONS ===
+
+    - name: Dump event info
+      if: always()
+      # Usually unnecessary, but insanely useful if IRC notifications fail.
+      run: |
+        cat <<"EOF"
+        ${{ toJSON(github.event) }}
+        EOF
+    - name: Generate IRC message
+      if: matrix.should-notify-irc == true && !cancelled()
+      run: |
+        ${{ github.workspace }}/Meta/notify_irc.py <<"EOF"
+        ["${{ github.actor }}", ${{ github.run_id }}, "${{ job.status }}",
+        ${{ toJSON(github.event) }}
+        ]
+        EOF
+
+  build_lagom_with_fuzzers:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v2
+
+    # === OS SETUP ===
+    #
+    - name: Install dependencies
+      run: sudo apt-get install ninja-build
+    - name: Check versions
+      run: set +e; clang --version; clang++ --version; ninja --version
+
+    # === PREPARE FOR BUILDING ===
+
+    # TODO: ccache
+    # https://cristianadam.eu/20200113/speeding-up-c-plus-plus-github-actions-using-ccache/
+    # https://github.com/cristianadam/HelloWorld/blob/master/.github/workflows/build_cmake.yml
+    - name: Create build environment
+      working-directory: ${{ github.workspace }}/Meta/Lagom
+      run: |
+        mkdir -p Build
+        cd Build
+        cmake -GNinja -DBUILD_LAGOM=ON -DENABLE_FUZZER_SANITIZER=ON -DENABLE_ADDRESS_SANITIZER=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ..
+
+    # === ACTUALLY BUILD ===
+
+    - name: Build Lagom with Fuzzers
+      working-directory: ${{ github.workspace }}/Meta/Lagom/Build
+      run: cmake --build .

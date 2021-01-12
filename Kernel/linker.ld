@@ -2,28 +2,48 @@ ENTRY(start)
 
 SECTIONS
 {
-	. = 0x10000;
+    . = 0xc0100000;
 
-	.text BLOCK(4K) : ALIGN(4K)
-	{
-        Boot/boot.ao
-		*(.multiboot)
-		*(.text)
-	}
+    start_of_kernel_image = .;
 
-	.rodata BLOCK(4K) : ALIGN(4K)
-	{
-		*(.rodata)
-	}
+    .text ALIGN(4K) : AT (ADDR(.text) - 0xc0000000)
+    {
+        $<TARGET_OBJECTS:boot>
+        *(.multiboot)
+        start_of_kernel_text = .;
+        *(.text)
+        *(.text.startup)
+        end_of_kernel_text = .;
+    }
 
-	.data BLOCK(4K) : ALIGN(4K)
-	{
-		*(.data)
-	}
+    .rodata ALIGN(4K) : AT (ADDR(.rodata) - 0xc0000000)
+    {
+        start_heap_ctors = .;
+        *libkernel_heap.a:*(.ctors)
+        end_heap_ctors = .;
 
-	.bss BLOCK(4K) : ALIGN(4K)
-	{
-		*(COMMON)
-		*(.bss)
-	}
+        start_ctors = .;
+        *(.ctors)
+        end_ctors = .;
+
+        *(.rodata)
+    }
+
+    .data ALIGN(4K) : AT (ADDR(.data) - 0xc0000000)
+    {
+        start_of_kernel_data = .;
+        *(.data)
+        end_of_kernel_data = .;
+    }
+
+    .bss ALIGN(4K) : AT (ADDR(.bss) - 0xc0000000)
+    {
+        start_of_kernel_bss = .;
+        *(page_tables)
+        *(COMMON)
+        *(.bss)
+        end_of_kernel_bss = .;
+    }
+
+    end_of_kernel_image = .;
 }
