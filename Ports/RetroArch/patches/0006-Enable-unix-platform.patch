@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chocolateimage <chocolateimage@protonmail.com>
+Date: Tue, 15 Oct 2024 21:09:31 +0200
+Subject: [PATCH] Enable unix platform
+
+This will make arguments from shell (like `--help`) work
+---
+ Makefile.common            | 3 +++
+ frontend/frontend_driver.c | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile.common b/Makefile.common
+index 57dabf5eac07efae17758161b3f5605eb8d46ca6..8f96234844711ff1b31411d1c53a7011c7cf843e 100644
+--- a/Makefile.common
++++ b/Makefile.common
+@@ -186,6 +186,9 @@ ifneq ($(findstring Linux,$(OS)),)
+    HAVE_UNIX = 1
+ endif
+ 
++ifneq ($(findstring SerenityOS,$(OS)),)
++   HAVE_UNIX = 1
++endif
+ ifeq ($(HAVE_UNIX), 1)
+    OBJ += frontend/drivers/platform_unix.o
+ 
+diff --git a/frontend/frontend_driver.c b/frontend/frontend_driver.c
+index 65463857960124c7fe025ec8f358384825f5ec7e..cca68ad39bcbe5c928a60ea427a8705518ef32a9 100644
+--- a/frontend/frontend_driver.c
++++ b/frontend/frontend_driver.c
+@@ -98,7 +98,7 @@ static frontend_ctx_driver_t *frontend_ctx_drivers[] = {
+ #if defined(__APPLE__) && defined(__MACH__)
+    &frontend_ctx_darwin,
+ #endif
+-#if defined(__linux__) || (defined(BSD) && !defined(__MACH__))
++#if defined(__linux__) || (defined(BSD) && !defined(__MACH__)) || defined(__serenity__)
+    &frontend_ctx_unix,
+ #endif
+ #if defined(PSP) || defined(VITA)

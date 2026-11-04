@@ -1,19 +1,35 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include <AK/AKString.h>
-#include <AK/Vector.h>
+#include <AK/Forward.h>
+#include <AK/SetOnce.h>
 
-struct KSym {
-    dword address;
-    const char* name;
+namespace Kernel {
+
+struct KernelSymbol {
+    FlatPtr address;
+    char const* name;
 };
 
-const KSym* ksymbolicate(dword address);
-void load_ksyms();
-void init_ksyms();
+enum class PrintToScreen {
+    No,
+    Yes,
+};
 
-extern bool ksyms_ready;
-extern dword ksym_lowest_address;
-extern dword ksym_highest_address;
+FlatPtr address_for_kernel_symbol(StringView name);
+KernelSymbol const* symbolicate_kernel_address(FlatPtr);
+void load_kernel_symbol_table();
 
-void dump_backtrace();
+extern SetOnce g_kernel_symbols_available;
+extern FlatPtr g_lowest_kernel_symbol_address;
+extern FlatPtr g_highest_kernel_symbol_address;
+
+void dump_backtrace(PrintToScreen print_to_screen = PrintToScreen::No);
+void dump_backtrace_from_base_pointer(FlatPtr base_pointer);
+
+}

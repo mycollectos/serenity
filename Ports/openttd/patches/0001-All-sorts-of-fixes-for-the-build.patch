@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gunnar Beutner <gbeutner@serenityos.org>
+Date: Tue, 5 Apr 2022 23:05:14 +0200
+Subject: [PATCH] All sorts of fixes for the build
+
+Co-Authored-By: Kevin Nobel <kevin@2sk.nl>
+---
+ cmake/CompileFlags.cmake          | 2 +-
+ src/network/core/os_abstraction.h | 1 +
+ src/safeguards.h                  | 2 ++
+ src/stdafx.h                      | 2 +-
+ 4 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/cmake/CompileFlags.cmake b/cmake/CompileFlags.cmake
+index 1f613e9377ee99af75df2a7d9ddc35dd9671ae91..280e881df86de16059f77c893608bf0758d8a874 100644
+--- a/cmake/CompileFlags.cmake
++++ b/cmake/CompileFlags.cmake
+@@ -149,7 +149,7 @@ macro(compile_flags)
+         message(FATAL_ERROR "No warning flags are set for this compiler yet; please consider creating a Pull Request to add support for this compiler.")
+     endif()
+ 
+-    if(NOT WIN32 AND NOT HAIKU)
++    if(NOT WIN32 AND NOT HAIKU AND NOT SERENITYOS)
+         # rdynamic is used to get useful stack traces from crash reports.
+         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+     endif()
+diff --git a/src/network/core/os_abstraction.h b/src/network/core/os_abstraction.h
+index 5de279a25d068fca8b6e326649b710676fbc6478..99b90ba9e14174200b8c3b70fba38e975881ae88 100644
+--- a/src/network/core/os_abstraction.h
++++ b/src/network/core/os_abstraction.h
+@@ -74,6 +74,7 @@ typedef unsigned long in_addr_t;
+ #	include <unistd.h>
+ #	include <sys/ioctl.h>
+ #	include <sys/socket.h>
++#	include <sys/select.h>
+ #	include <netinet/in.h>
+ #	include <netinet/tcp.h>
+ #	include <arpa/inet.h>
+diff --git a/src/safeguards.h b/src/safeguards.h
+index 8e3568e2b14f65e240b0559344c6f963cf7e91be..d42ab79b98096a2b441402616fad1f453d0598ad 100644
+--- a/src/safeguards.h
++++ b/src/safeguards.h
+@@ -50,7 +50,9 @@
+ #define memcmp SAFEGUARD_DO_NOT_USE_THIS_METHOD
+ #define memcpy SAFEGUARD_DO_NOT_USE_THIS_METHOD
+ #define memmove SAFEGUARD_DO_NOT_USE_THIS_METHOD
++#ifndef __serenity__
+ #define memset SAFEGUARD_DO_NOT_USE_THIS_METHOD
++#endif
+ 
+ /* Use fgets instead. */
+ #define gets      SAFEGUARD_DO_NOT_USE_THIS_METHOD
+diff --git a/src/stdafx.h b/src/stdafx.h
+index f264bf6bbc8f153c5210228c3feb44d81956d6b3..76cbb08e4818e1fbd511cb3a53606227acaf0508 100644
+--- a/src/stdafx.h
++++ b/src/stdafx.h
+@@ -232,7 +232,7 @@ using namespace std::literals::string_view_literals;
+ #endif
+ 
+ /* This is already defined in unix, but not in QNX Neutrino (6.x) or Cygwin. */
+-#if (!defined(UNIX) && !defined(__HAIKU__)) || defined(__QNXNTO__) || defined(__CYGWIN__)
++#if (!defined(UNIX) && !defined(__HAIKU__)) || defined(__QNXNTO__) || defined(__CYGWIN__) || defined(__serenity__)
+ 	typedef unsigned int uint;
+ #endif
+ 

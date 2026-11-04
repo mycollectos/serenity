@@ -1,121 +1,137 @@
-#include <Kernel/FileSystem/FIFO.h>
-#include <Kernel/FileSystem/FileDescriptor.h>
-#include <Kernel/Lock.h>
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Atomic.h>
 #include <AK/StdLibExtras.h>
-#include <AK/HashTable.h>
+#include <Kernel/FileSystem/FIFO.h>
+#include <Kernel/FileSystem/OpenFileDescription.h>
+#include <Kernel/Locking/Mutex.h>
+#include <Kernel/Tasks/Process.h>
+#include <Kernel/Tasks/Thread.h>
 
-//#define FIFO_DEBUG
+namespace Kernel {
 
-Lockable<HashTable<FIFO*>>& all_fifos()
+static Atomic<int> s_next_fifo_id = 1;
+
+ErrorOr<NonnullRefPtr<FIFO>> FIFO::try_create(UserID uid)
 {
-    static Lockable<HashTable<FIFO*>>* s_table;
-    if (!s_table)
-        s_table = new Lockable<HashTable<FIFO*>>;
-    return *s_table;
+    auto buffer = TRY(DoubleBuffer::try_create("FIFO: Buffer"sv));
+    return adopt_nonnull_ref_or_enomem(new (nothrow) FIFO(uid, move(buffer)));
 }
 
-RetainPtr<FIFO> FIFO::from_fifo_id(dword id)
+ErrorOr<NonnullRefPtr<OpenFileDescription>> FIFO::open_direction(FIFO::Direction direction, ShouldBlock block)
 {
-    auto* ptr = reinterpret_cast<FIFO*>(id);
-    LOCKER(all_fifos().lock());
-    if (auto it = all_fifos().resource().find(ptr); it == all_fifos().resource().end())
-        return nullptr;
-    return ptr;
-}
+    MutexLocker locker(m_open_lock);
 
-Retained<FIFO> FIFO::create(uid_t uid)
-{
-    return adopt(*new FIFO(uid));
-}
+    // "If O_NONBLOCK is set, [...]. An open() for writing-only shall return an error
+    // if no process currently has the file open for reading."
+    if (block == ShouldBlock::No && direction == Direction::Writer && m_readers == 0)
+        return ENXIO;
 
-Retained<FileDescriptor> FIFO::open_direction(FIFO::Direction direction)
-{
-    auto descriptor = FileDescriptor::create(this);
-    attach(direction);
-    descriptor->set_fifo_direction({ }, direction);
-    return descriptor;
-}
-
-FIFO::FIFO(uid_t uid)
-    : m_uid(uid)
-{
-    LOCKER(all_fifos().lock());
-    all_fifos().resource().set(this);
-}
-
-FIFO::~FIFO()
-{
-    LOCKER(all_fifos().lock());
-    all_fifos().resource().remove(this);
-}
-
-void FIFO::attach(Direction direction)
-{
+    auto description = TRY(OpenFileDescription::try_create(*this));
     if (direction == Direction::Reader) {
         ++m_readers;
-#ifdef FIFO_DEBUG
-        kprintf("open reader (%u)\n", m_readers);
-#endif
     } else if (direction == Direction::Writer) {
         ++m_writers;
-#ifdef FIFO_DEBUG
-        kprintf("open writer (%u)\n", m_writers);
-#endif
     }
+    evaluate_block_conditions();
+    description->set_fifo_direction({}, direction);
+
+    if (direction == Direction::Reader) {
+        m_read_open_queue.wake_all();
+
+        if (block == ShouldBlock::Yes && m_writers == 0) {
+            locker.unlock();
+            m_write_open_queue.wait_forever("FIFO"sv);
+            locker.lock();
+        }
+    } else if (direction == Direction::Writer) {
+        m_write_open_queue.wake_all();
+
+        if (m_readers == 0) {
+            locker.unlock();
+            m_read_open_queue.wait_forever("FIFO"sv);
+            locker.lock();
+        }
+    }
+
+    return description;
 }
 
-void FIFO::detach(Direction direction)
+FIFO::FIFO(UserID uid, NonnullOwnPtr<DoubleBuffer> buffer)
+    : m_buffer(move(buffer))
+    , m_uid(uid)
 {
+    m_fifo_id = ++s_next_fifo_id;
+
+    // Use the same block condition for read and write
+    m_buffer->set_unblock_callback([this]() {
+        evaluate_block_conditions();
+    });
+}
+
+FIFO::~FIFO() = default;
+
+void FIFO::detach(OpenFileDescription& description)
+{
+    File::detach(description);
+
+    auto direction = description.fifo_direction();
     if (direction == Direction::Reader) {
-#ifdef FIFO_DEBUG
-        kprintf("close reader (%u - 1)\n", m_readers);
-#endif
-        ASSERT(m_readers);
+        VERIFY(m_readers);
         --m_readers;
     } else if (direction == Direction::Writer) {
-#ifdef FIFO_DEBUG
-        kprintf("close writer (%u - 1)\n", m_writers);
-#endif
-        ASSERT(m_writers);
+        VERIFY(m_writers);
         --m_writers;
     }
+
+    evaluate_block_conditions();
 }
 
-bool FIFO::can_read(FileDescriptor&) const
+bool FIFO::can_read(OpenFileDescription const&, u64) const
 {
-    return !m_buffer.is_empty() || !m_writers;
+    return !m_buffer->is_empty() || !m_writers;
 }
 
-bool FIFO::can_write(FileDescriptor&) const
+bool FIFO::can_write(OpenFileDescription const&, u64) const
 {
-    return m_buffer.bytes_in_write_buffer() < 4096;
+    return m_buffer->space_for_writing() || !m_readers;
 }
 
-ssize_t FIFO::read(FileDescriptor&, byte* buffer, ssize_t size)
+ErrorOr<size_t> FIFO::read(OpenFileDescription& fd, u64, UserOrKernelBuffer& buffer, size_t size)
 {
-    if (!m_writers && m_buffer.is_empty())
-        return 0;
-#ifdef FIFO_DEBUG
-    dbgprintf("fifo: read(%u)\n",size);
-#endif
-    ssize_t nread = m_buffer.read(buffer, size);
-#ifdef FIFO_DEBUG
-    dbgprintf("   -> read (%c) %u\n", buffer[0], nread);
-#endif
-    return nread;
+    if (m_buffer->is_empty()) {
+        if (!m_writers)
+            return 0;
+        if (!fd.is_blocking())
+            return EAGAIN;
+    }
+    return m_buffer->read(buffer, size);
 }
 
-ssize_t FIFO::write(FileDescriptor&, const byte* buffer, ssize_t size)
+ErrorOr<size_t> FIFO::write(OpenFileDescription& fd, u64, UserOrKernelBuffer const& buffer, size_t size)
 {
     if (!m_readers)
-        return 0;
-#ifdef FIFO_DEBUG
-    dbgprintf("fifo: write(%p, %u)\n", buffer, size);
-#endif
-    return m_buffer.write(buffer, size);
+        return EPIPE;
+    if (!fd.is_blocking() && m_buffer->space_for_writing() == 0)
+        return EAGAIN;
+
+    return m_buffer->write(buffer, size);
 }
 
-String FIFO::absolute_path(FileDescriptor&) const
+ErrorOr<NonnullOwnPtr<KString>> FIFO::pseudo_path(OpenFileDescription const&) const
 {
-    return String::format("fifo:%u", this);
+    return KString::formatted("fifo:{}", m_fifo_id);
+}
+
+ErrorOr<struct stat> FIFO::stat() const
+{
+    struct stat st = {};
+    st.st_mode = S_IFIFO;
+    return st;
+}
+
 }

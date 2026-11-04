@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Schumacher <timschumi@gmx.de>
+Date: Thu, 30 Nov 2023 15:45:32 +0100
+Subject: [PATCH] file-posix: Include the correct file for ioctl on SerenityOS
+
+---
+ block/file-posix.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/block/file-posix.c b/block/file-posix.c
+index 3c985da94f563be9463b05c3573ac95e2d726f06..ce0d3343d7e43c8221436be76aa6ae262fda7648 100644
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -109,6 +109,10 @@
+ #include <sys/diskslice.h>
+ #endif
+ 
++#ifdef __serenity__
++#include <sys/ioctl.h>
++#endif
++
+ /* OS X does not have O_DSYNC */
+ #ifndef O_DSYNC
+ #ifdef O_SYNC

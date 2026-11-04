@@ -1,96 +1,106 @@
+/*
+ * Copyright (c) 2018-2021, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include <Kernel/Devices/DiskDevice.h>
-#include "InodeIdentifier.h"
-#include "InodeMetadata.h"
-#include "UnixTypes.h"
-#include <AK/ByteBuffer.h>
-#include <AK/HashMap.h>
-#include <AK/OwnPtr.h>
-#include <AK/Retainable.h>
-#include <AK/RetainPtr.h>
-#include <AK/AKString.h>
-#include <AK/Function.h>
-#include <AK/kstdio.h>
-#include <Kernel/Lock.h>
-#include <AK/WeakPtr.h>
-#include <Kernel/KResult.h>
+#include <AK/AtomicRefCounted.h>
+#include <AK/Error.h>
+#include <AK/StringView.h>
+#include <Kernel/FileSystem/InodeIdentifier.h>
+#include <Kernel/Forward.h>
+#include <Kernel/Library/LockRefPtr.h>
+#include <Kernel/Library/UserOrKernelBuffer.h>
+#include <Kernel/Locking/Mutex.h>
+#include <Kernel/UnixTypes.h>
 
-static const dword mepoch = 476763780;
+namespace Kernel {
 
-class Inode;
-class FileDescriptor;
-class LocalSocket;
-class VMObject;
-
-class FS : public Retainable<FS> {
+class FileSystem : public AtomicRefCounted<FileSystem> {
     friend class Inode;
-public:
-    virtual ~FS();
 
-    unsigned fsid() const { return m_fsid; }
-    static FS* from_fsid(dword);
+public:
+    virtual ~FileSystem();
+
+    FileSystemID fsid() const { return m_fsid; }
     static void sync();
 
-    virtual bool initialize() = 0;
-    virtual const char* class_name() const = 0;
-    virtual InodeIdentifier root_inode() const = 0;
+    virtual ErrorOr<void> initialize() = 0;
+    virtual StringView class_name() const = 0;
+    virtual Inode& root_inode() = 0;
+    virtual bool supports_watchers() const { return false; }
+
+    virtual ErrorOr<void> rename(Inode& old_parent_inode, StringView old_basename, Inode& new_parent_inode, StringView new_basename) = 0;
+
+    // FIXME: We should aim to provide more concise mechanism to ensure
+    // that backing Inodes from the FileSystem are kept intact so we can
+    // attach them to a loop device.
+    virtual bool supports_backing_loop_devices() const { return false; }
 
     bool is_readonly() const { return m_readonly; }
 
-    virtual unsigned total_block_count() const { return 0; }
-    virtual unsigned free_block_count() const { return 0; }
-    virtual unsigned total_inode_count() const { return 0; }
-    virtual unsigned free_inode_count() const { return 0; }
+    virtual u64 total_block_count() const { return 0; }
+    virtual u64 free_block_count() const { return 0; }
+    virtual u64 total_inode_count() const { return 0; }
+    virtual u64 free_inode_count() const { return 0; }
 
-    struct DirectoryEntry {
-        DirectoryEntry(const char* name, InodeIdentifier, byte file_type);
-        DirectoryEntry(const char* name, int name_length, InodeIdentifier, byte file_type);
-        char name[256];
-        int name_length { 0 };
+    ErrorOr<void> prepare_to_unmount(Inode& mount_guest_inode);
+
+    struct DirectoryEntryView {
+        DirectoryEntryView(StringView name, InodeIdentifier, u8 file_type);
+
+        StringView name;
         InodeIdentifier inode;
-        byte file_type { 0 };
+        u8 file_type { 0 };
     };
 
-    virtual RetainPtr<Inode> create_inode(InodeIdentifier parentInode, const String& name, mode_t, off_t size, dev_t, int& error) = 0;
-    virtual RetainPtr<Inode> create_directory(InodeIdentifier parentInode, const String& name, mode_t, int& error) = 0;
+    virtual ErrorOr<void> flush_writes() { return {}; }
 
-    virtual RetainPtr<Inode> get_inode(InodeIdentifier) const = 0;
+    u64 logical_block_size() const { return m_logical_block_size; }
+    size_t fragment_size() const { return m_fragment_size; }
 
-    virtual void flush_writes() { }
+    virtual bool is_file_backed() const { return false; }
+
+    // Converts file types that are used internally by the filesystem to DT_* types
+    virtual u8 internal_file_type_to_directory_entry_type(DirectoryEntryView const& entry) const { return entry.file_type; }
+
+    SpinlockProtected<size_t, LockRank::FileSystem>& mounted_count() { return m_attach_count; }
 
 protected:
-    FS();
+    FileSystem();
 
-    mutable Lock m_lock { "FS" };
+    void set_logical_block_size(u64 size) { m_logical_block_size = size; }
+    void set_fragment_size(size_t size) { m_fragment_size = size; }
+
+    virtual ErrorOr<void> prepare_to_clear_last_mount([[maybe_unused]] Inode& mount_guest_inode) { return {}; }
+
+    mutable Mutex m_lock { "FS"sv };
 
 private:
-    unsigned m_fsid { 0 };
+    FileSystemID m_fsid;
+    u64 m_logical_block_size { 0 };
+    size_t m_fragment_size { 0 };
     bool m_readonly { false };
+
+    SpinlockProtected<size_t, LockRank::FileSystem> m_attach_count { 0 };
+    IntrusiveListNode<FileSystem> m_file_system_node;
+
+public:
+    using List = IntrusiveList<&FileSystem::m_file_system_node>;
+
+    // NOTE: This method is implemented in Kernel/FileSystem/VirtualFileSystem.cpp
+    static SpinlockProtected<FileSystem::List, LockRank::FileSystem>& all_file_systems_list();
 };
 
-inline FS* InodeIdentifier::fs()
-{
-    return FS::from_fsid(m_fsid);
-}
-
-inline const FS* InodeIdentifier::fs() const
-{
-    return FS::from_fsid(m_fsid);
-}
-
-inline bool InodeIdentifier::is_root_inode() const
-{
-    return (*this) == fs()->root_inode();
 }
 
 namespace AK {
 
 template<>
-struct Traits<InodeIdentifier> {
-    static unsigned hash(const InodeIdentifier& inode) { return pair_int_hash(inode.fsid(), inode.index()); }
-    static void dump(const InodeIdentifier& inode) { kprintf("%02u:%08u", inode.fsid(), inode.index()); }
+struct Traits<Kernel::InodeIdentifier> : public DefaultTraits<Kernel::InodeIdentifier> {
+    static unsigned hash(Kernel::InodeIdentifier const& inode) { return pair_int_hash(inode.fsid().value(), inode.index().value()); }
 };
 
 }
-

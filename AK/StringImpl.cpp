@@ -1,23 +1,14 @@
-#include "StringImpl.h"
-#include "StdLibExtras.h"
-#include "kmalloc.h"
-#include "HashTable.h"
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
 
-//#define DEBUG_STRINGIMPL
-
-#ifdef DEBUG_STRINGIMPL
-unsigned g_stringimpl_count;
-static HashTable<StringImpl*>* g_all_live_stringimpls;
-
-void dump_all_stringimpls()
-{
-    unsigned i = 0;
-    for (auto& it : *g_all_live_stringimpls) {
-        dbgprintf("%u: \"%s\"\n", i, (*it).characters());
-        ++i;
-    }
-}
-#endif
+#include <AK/CharacterTypes.h>
+#include <AK/DeprecatedFlyString.h>
+#include <AK/StringHash.h>
+#include <AK/StringImpl.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -25,55 +16,37 @@ static StringImpl* s_the_empty_stringimpl = nullptr;
 
 StringImpl& StringImpl::the_empty_stringimpl()
 {
-    if (!s_the_empty_stringimpl)
-        s_the_empty_stringimpl = new StringImpl(ConstructTheEmptyStringImpl);;
+    if (!s_the_empty_stringimpl) {
+        void* slot = kmalloc(sizeof(StringImpl) + sizeof(char));
+        s_the_empty_stringimpl = new (slot) StringImpl(ConstructTheEmptyStringImpl);
+    }
     return *s_the_empty_stringimpl;
 }
 
-StringImpl::StringImpl(ConstructWithInlineBufferTag, ssize_t length)
+StringImpl::StringImpl(ConstructWithInlineBufferTag, size_t length)
     : m_length(length)
-    , m_characters(m_inline_buffer)
 {
-#ifdef DEBUG_STRINGIMPL
-    if (!g_all_live_stringimpls)
-        g_all_live_stringimpls = new HashTable<StringImpl*>;
-    ++g_stringimpl_count;
-    g_all_live_stringimpls->set(this);
-#endif
 }
 
 StringImpl::~StringImpl()
 {
-#ifdef DEBUG_STRINGIMPL
-    --g_stringimpl_count;
-    g_all_live_stringimpls->remove(this);
-#endif
+    if (m_fly)
+        DeprecatedFlyString::did_destroy_impl({}, *this);
 }
 
-static inline ssize_t allocation_size_for_stringimpl(ssize_t length)
+NonnullRefPtr<StringImpl const> StringImpl::create_uninitialized(size_t length, char*& buffer)
 {
-    return sizeof(StringImpl) + (sizeof(char) * length) + sizeof(char);
-}
-
-Retained<StringImpl> StringImpl::create_uninitialized(ssize_t length, char*& buffer)
-{
-    ASSERT(length);
+    VERIFY(length);
     void* slot = kmalloc(allocation_size_for_stringimpl(length));
-    ASSERT(slot);
-    auto new_stringimpl = adopt(*new (slot) StringImpl(ConstructWithInlineBuffer, length));
-    buffer = const_cast<char*>(new_stringimpl->m_characters);
+    VERIFY(slot);
+    auto new_stringimpl = adopt_ref(*new (slot) StringImpl(ConstructWithInlineBuffer, length));
+    buffer = const_cast<char*>(new_stringimpl->characters());
     buffer[length] = '\0';
     return new_stringimpl;
 }
 
-RetainPtr<StringImpl> StringImpl::create(const char* cstring, ssize_t length, ShouldChomp should_chomp)
+RefPtr<StringImpl const> StringImpl::create(char const* cstring, size_t length, ShouldChomp should_chomp)
 {
-    if (!cstring)
-        return nullptr;
-
-    if (!*cstring)
-        return the_empty_stringimpl();
-
     if (should_chomp) {
         while (length) {
             char last_ch = cstring[length - 1];
@@ -94,68 +67,62 @@ RetainPtr<StringImpl> StringImpl::create(const char* cstring, ssize_t length, Sh
     return new_stringimpl;
 }
 
-RetainPtr<StringImpl> StringImpl::create(const char* cstring, ShouldChomp shouldChomp)
+RefPtr<StringImpl const> StringImpl::create(char const* cstring, ShouldChomp shouldChomp)
 {
-    if (!cstring)
-        return nullptr;
+    if (!cstring || !*cstring)
+        return the_empty_stringimpl();
 
     return create(cstring, strlen(cstring), shouldChomp);
 }
 
-static inline bool is_ascii_lowercase(char c)
+RefPtr<StringImpl const> StringImpl::create(ReadonlyBytes bytes, ShouldChomp shouldChomp)
 {
-    return c >= 'a' && c <= 'z';
+    return StringImpl::create(reinterpret_cast<char const*>(bytes.data()), bytes.size(), shouldChomp);
 }
 
-static inline bool is_ascii_uppercase(char c)
+RefPtr<StringImpl const> StringImpl::create_lowercased(char const* cstring, size_t length)
 {
-    return c >= 'A' && c <= 'Z';
+    if (!length)
+        return the_empty_stringimpl();
+    char* buffer;
+    auto impl = create_uninitialized(length, buffer);
+    for (size_t i = 0; i < length; ++i)
+        buffer[i] = (char)to_ascii_lowercase(cstring[i]);
+    return impl;
 }
 
-static inline char to_ascii_lowercase(char c)
+RefPtr<StringImpl const> StringImpl::create_uppercased(char const* cstring, size_t length)
 {
-    if (is_ascii_uppercase(c))
-        return c | 0x20;
-    return c;
+    if (!length)
+        return the_empty_stringimpl();
+    char* buffer;
+    auto impl = create_uninitialized(length, buffer);
+    for (size_t i = 0; i < length; ++i)
+        buffer[i] = (char)to_ascii_uppercase(cstring[i]);
+    return impl;
 }
 
-static inline char to_ascii_uppercase(char c)
+NonnullRefPtr<StringImpl const> StringImpl::to_lowercase() const
 {
-    if (is_ascii_lowercase(c))
-        return c & ~0x20;
-    return c;
-}
-
-Retained<StringImpl> StringImpl::to_lowercase() const
-{
-    for (ssize_t i = 0; i < m_length; ++i) {
-        if (!is_ascii_lowercase(m_characters[i]))
-            goto slow_path;
+    for (size_t i = 0; i < m_length; ++i) {
+        if (is_ascii_upper_alpha(characters()[i]))
+            return create_lowercased(characters(), m_length).release_nonnull();
     }
     return const_cast<StringImpl&>(*this);
-
-slow_path:
-    char* buffer;
-    auto lowercased = create_uninitialized(m_length, buffer);
-    for (ssize_t i = 0; i < m_length; ++i)
-        buffer[i] = to_ascii_lowercase(m_characters[i]);
-    return lowercased;
 }
 
-Retained<StringImpl> StringImpl::to_uppercase() const
+NonnullRefPtr<StringImpl const> StringImpl::to_uppercase() const
 {
-    for (ssize_t i = 0; i < m_length; ++i) {
-        if (!is_ascii_uppercase(m_characters[i]))
-            goto slow_path;
+    for (size_t i = 0; i < m_length; ++i) {
+        if (is_ascii_lower_alpha(characters()[i]))
+            return create_uppercased(characters(), m_length).release_nonnull();
     }
     return const_cast<StringImpl&>(*this);
+}
 
-slow_path:
-    char* buffer;
-    auto uppercased = create_uninitialized(m_length, buffer);
-    for (ssize_t i = 0; i < m_length; ++i)
-        buffer[i] = to_ascii_uppercase(m_characters[i]);
-    return uppercased;
+unsigned StringImpl::case_insensitive_hash() const
+{
+    return case_insensitive_string_hash(characters(), length());
 }
 
 void StringImpl::compute_hash() const
@@ -163,9 +130,8 @@ void StringImpl::compute_hash() const
     if (!length())
         m_hash = 0;
     else
-        m_hash = string_hash(m_characters, m_length);
-    m_hasHash = true;
+        m_hash = string_hash(characters(), m_length);
+    m_has_hash = true;
 }
 
 }
-

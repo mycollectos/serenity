@@ -1,211 +1,221 @@
+/*
+ * Copyright (c) 2018-2022, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#ifdef KERNEL
-#include <Kernel/StdLib.h>
+#include <AK/Platform.h>
+
+#if defined(AK_COMPILER_CLANG)
+#    pragma clang diagnostic ignored "-Wunqualified-std-cast-call"
+#endif
+
+#include <AK/StdLibExtraDetails.h>
+#include <AK/StdShim.h>
+
+#include <AK/Assertions.h>
+
+namespace AK {
+
+template<typename T, typename U>
+constexpr auto round_up_to_power_of_two(T value, U power_of_two)
+requires(AK::Detail::IsIntegral<T> && AK::Detail::IsIntegral<U>)
+{
+    return ((value - 1) & ~(power_of_two - 1)) + power_of_two;
+}
+
+template<typename T>
+constexpr bool is_power_of_two(T value)
+requires(AK::Detail::IsIntegral<T>)
+{
+    return value && !((value) & (value - 1));
+}
+
+template<typename... Args>
+void compiletime_fail(Args...);
+
+}
+
+#if !USING_AK_GLOBALLY || defined(AK_DONT_REPLACE_STD)
+#    define AK_REPLACED_STD_NAMESPACE AK::replaced_std
 #else
-#include <stdlib.h>
-#include <string.h>
+#    define AK_REPLACED_STD_NAMESPACE std
 #endif
 
-#define UNUSED_PARAM(x) (void)x
-
-#include <AK/Types.h>
-
-#ifndef KERNEL
-extern "C" void* mmx_memcpy(void* to, const void* from, size_t);
-#endif
-
-[[gnu::always_inline]] inline void fast_dword_copy(dword* dest, const dword* src, size_t count)
-{
-#ifndef KERNEL
-    if (count >= 256) {
-        mmx_memcpy(dest, src, count * sizeof(count));
-        return;
-    }
-#endif
-    asm volatile(
-        "rep movsl\n"
-        : "=S"(src), "=D"(dest), "=c"(count)
-        : "S"(src), "D"(dest), "c"(count)
-        : "memory"
-    );
-}
-
-[[gnu::always_inline]] inline void fast_dword_fill(dword* dest, dword value, size_t count)
-{
-    asm volatile(
-        "rep stosl\n"
-        : "=D"(dest), "=c"(count)
-        : "D"(dest), "c"(count), "a"(value)
-        : "memory"
-    );
-}
-
-inline constexpr dword round_up_to_power_of_two(dword value, dword power_of_two)
-{
-    return ((value - 1) & ~ (power_of_two - 1)) + power_of_two;
+namespace AK::Detail {
+template<typename T>
+struct _RawPtr {
+    using Type = T*;
+};
 }
 
 namespace AK {
 
-template<typename T>
-inline T min(const T& a, const T& b)
+struct Empty {
+    constexpr bool operator==(Empty const&) const = default;
+};
+
+template<typename T, typename SizeType = decltype(sizeof(T)), SizeType N>
+constexpr SizeType array_size(T (&)[N])
 {
-    return a < b ? a : b;
+    return N;
 }
 
 template<typename T>
-inline T max(const T& a, const T& b)
+constexpr T min(T const& a, IdentityType<T> const& b)
+{
+    return b < a ? b : a;
+}
+
+template<typename T>
+constexpr T max(T const& a, IdentityType<T> const& b)
 {
     return a < b ? b : a;
 }
 
+template<typename T>
+constexpr T clamp(T const& value, IdentityType<T> const& min, IdentityType<T> const& max)
+{
+    VERIFY(max >= min);
+    if (value > max)
+        return max;
+    if (value < min)
+        return min;
+    return value;
+}
 
 template<typename T, typename U>
-static inline T ceil_div(T a, U b)
+constexpr T mix(T const& v1, T const& v2, U const& interpolation) // aka lerp
 {
-    static_assert(sizeof(T) == sizeof(U));
+    return v1 + (v2 - v1) * interpolation;
+}
+
+template<typename T>
+constexpr T mod(T const& a, IdentityType<T> const& b)
+{
+    VERIFY(b != 0);
+    return (a % b + b) % b;
+}
+
+template<typename T, typename U>
+constexpr T ceil_div(T a, U b)
+{
     T result = a / b;
-    if ((a % b) != 0)
+    if ((a % b) != 0 && (a > 0) == (b > 0))
         ++result;
     return result;
 }
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wconsumed"
-#endif
-template <typename T>
-T&& move(T& arg)
+template<typename T, typename U>
+constexpr T floor_div(T a, U b)
 {
-    return static_cast<T&&>(arg);
-}
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-
-template<typename T>
-struct Identity {
-    typedef T Type;
-};
-
-template<class T>
-constexpr T&& forward(typename Identity<T>::Type& param)
-{
-    return static_cast<T&&>(param);
+    T result = a / b;
+    if ((a % b) != 0 && (a > 0) != (b > 0))
+        --result;
+    return result;
 }
 
 template<typename T, typename U>
-T exchange(T& a, U&& b)
+inline void swap(T& a, U& b)
 {
-    T tmp = move(a);
-    a = move(b);
-    return tmp;
-}
-
-template<typename T, typename U>
-void swap(T& a, U& b)
-{
-    U tmp = move((U&)a);
-    a = (T&&)move(b);
+    if (&a == &b)
+        return;
+    U tmp = move(static_cast<U&>(a));
+    a = static_cast<T&&>(move(b));
     b = move(tmp);
 }
 
-template<bool B, class T = void>
-struct EnableIf
+template<typename T, typename U = T>
+constexpr T exchange(T& slot, U&& value)
 {
-};
-
-template<class T>
-struct EnableIf<true, T>
-{
-    typedef T Type;
-};
-
-template<class T> struct RemoveConst { typedef T Type; };
-template<class T> struct RemoveConst<const T> { typedef T Type; };
-template<class T> struct RemoveVolatile { typedef T Type; };
-template<class T> struct RemoveVolatile<const T> { typedef T Type; };
-template<class T> struct RemoveCV {
-    typedef typename RemoveVolatile<typename RemoveConst<T>::Type>::Type Type;
-};
-
-template<class T, T v>
-struct IntegralConstant {
-    static constexpr T value = v;
-    typedef T ValueType;
-    typedef IntegralConstant Type;
-    constexpr operator ValueType() const { return value; }
-    constexpr ValueType operator()() const { return value; }
-};
-
-typedef IntegralConstant<bool, false> FalseType;
-typedef IntegralConstant<bool, true> TrueType;
-
-template<class T>
-struct __IsPointerHelper : FalseType { };
-
-template<class T>
-struct __IsPointerHelper<T*> : TrueType { };
-
-template<class T>
-struct IsPointer : __IsPointerHelper<typename RemoveCV<T>::Type> { };
-
-template<class> struct IsFunction : FalseType { };
-
-template<class Ret, class... Args> struct IsFunction<Ret(Args...)> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...)> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) volatile> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) volatile> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const volatile> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const volatile> : TrueType { };
-
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) volatile &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) volatile &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const volatile &> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const volatile &> : TrueType { };
-
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) volatile &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) volatile &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...) const volatile &&> : TrueType { };
-template<class Ret, class... Args> struct IsFunction<Ret(Args...,...) const volatile &&> : TrueType { };
-
-template<class T> struct IsRvalueReference : FalseType { };
-template<class T> struct IsRvalueReference<T&&> : TrueType { };
-
-template<class T> struct RemovePointer { typedef T Type; };
-template<class T> struct RemovePointer<T*> { typedef T Type; };
-template<class T> struct RemovePointer<T* const> { typedef T Type; };
-template<class T> struct RemovePointer<T* volatile> { typedef T Type; };
-template<class T> struct RemovePointer<T* const volatile> { typedef T Type; };
-
-template<typename T, typename U>
-struct IsSame {
-    enum { value = 0 };
-};
+    T old_value = move(slot);
+    slot = AK::forward<U>(value);
+    return old_value;
+}
 
 template<typename T>
-struct IsSame<T, T> {
-    enum { value = 1 };
-};
+using RawPtr = typename Detail::_RawPtr<T>::Type;
+
+template<typename V>
+constexpr decltype(auto) to_underlying(V value)
+requires(IsEnum<V>)
+{
+    return static_cast<UnderlyingType<V>>(value);
+}
+
+constexpr bool is_constant_evaluated()
+{
+#if __has_builtin(__builtin_is_constant_evaluated)
+    return __builtin_is_constant_evaluated();
+#else
+    return false;
+#endif
+}
+
+template<typename T>
+ALWAYS_INLINE constexpr void taint_for_optimizer(T& value)
+requires(IsIntegral<T>)
+{
+    if (!is_constant_evaluated()) {
+        asm volatile(""
+            : "+r"(value));
+    }
+}
+
+template<typename T>
+ALWAYS_INLINE constexpr void taint_for_optimizer(T& value)
+requires(!IsIntegral<T>)
+{
+    if (!is_constant_evaluated()) {
+        asm volatile(""
+            :
+            : "m"(value)
+            : "memory");
+    }
+}
+
+// These can't be exported into the global namespace as they would clash with the C standard library.
+
+#define __DEFINE_GENERIC_ABS(type, zero, intrinsic) \
+    constexpr type abs(type num)                    \
+    {                                               \
+        if (is_constant_evaluated())                \
+            return num < (zero) ? -num : num;       \
+        return __builtin_##intrinsic(num);          \
+    }
+
+__DEFINE_GENERIC_ABS(int, 0, abs);
+__DEFINE_GENERIC_ABS(long, 0L, labs);
+__DEFINE_GENERIC_ABS(long long, 0LL, llabs);
+#ifndef KERNEL
+__DEFINE_GENERIC_ABS(float, 0.0F, fabsf);
+__DEFINE_GENERIC_ABS(double, 0.0, fabs);
+__DEFINE_GENERIC_ABS(long double, 0.0L, fabsl);
+#endif
+
+#undef __DEFINE_GENERIC_ABS
 
 }
 
-using AK::min;
-using AK::max;
-using AK::move;
-using AK::forward;
-using AK::exchange;
-using AK::swap;
+#if USING_AK_GLOBALLY
+using AK::array_size;
 using AK::ceil_div;
-using AK::IsSame;
+using AK::clamp;
+using AK::Empty;
+using AK::exchange;
+using AK::floor_div;
+using AK::forward;
+using AK::is_constant_evaluated;
+using AK::is_power_of_two;
+using AK::max;
+using AK::min;
+using AK::mix;
+using AK::mod;
+using AK::move;
+using AK::RawPtr;
+using AK::round_up_to_power_of_two;
+using AK::swap;
+using AK::to_underlying;
+#endif

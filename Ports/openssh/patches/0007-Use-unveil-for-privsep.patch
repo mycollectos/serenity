@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Patrick Meyer <git@the-space.agency>
+Date: Sat, 30 Apr 2022 10:58:10 +0000
+Subject: [PATCH] Use unveil for privsep
+
+---
+ sshd-auth.c |  9 +++------
+ sshd.c      | 16 ----------------
+ 2 files changed, 3 insertions(+), 22 deletions(-)
+
+diff --git a/sshd-auth.c b/sshd-auth.c
+index 3adf1a4..c91018a 100644
+--- a/sshd-auth.c
++++ b/sshd-auth.c
+@@ -186,12 +186,9 @@ privsep_child_demote(void)
+ #endif
+ 	/* Demote the child */
+ 	if (privsep_chroot) {
+-		/* Change our root directory */
+-		if (chroot(_PATH_PRIVSEP_CHROOT_DIR) == -1)
+-			fatal("chroot(\"%s\"): %s", _PATH_PRIVSEP_CHROOT_DIR,
+-			    strerror(errno));
+-		if (chdir("/") == -1)
+-			fatal("chdir(\"/\"): %s", strerror(errno));
++		/* Hide the whole filesystem */
++		if (unveil(NULL, NULL) < 0)
++			fatal("unveil(NULL, NULL): %s", strerror(errno));
+ 
+ 		/*
+ 		 * Drop our privileges
+diff --git a/sshd.c b/sshd.c
+index da2aba9..1350928 100644
+--- a/sshd.c
++++ b/sshd.c
+@@ -1759,22 +1759,6 @@ main(int ac, char **av)
+ 	}
+ 	endpwent();
+ 
+-	if (need_chroot) {
+-		if ((stat(_PATH_PRIVSEP_CHROOT_DIR, &sb) == -1) ||
+-		    (S_ISDIR(sb.st_mode) == 0))
+-			fatal("Missing privilege separation directory: %s",
+-			    _PATH_PRIVSEP_CHROOT_DIR);
+-#ifdef HAVE_CYGWIN
+-		if (check_ntsec(_PATH_PRIVSEP_CHROOT_DIR) &&
+-		    (sb.st_uid != getuid () ||
+-		    (sb.st_mode & (S_IWGRP|S_IWOTH)) != 0))
+-#else
+-		if (sb.st_uid != 0 || (sb.st_mode & (S_IWGRP|S_IWOTH)) != 0)
+-#endif
+-			fatal("%s must be owned by root and not group or "
+-			    "world-writable.", _PATH_PRIVSEP_CHROOT_DIR);
+-	}
+-
+ 	if (test_flag > 1)
+ 		print_config(&connection_info);
+ 

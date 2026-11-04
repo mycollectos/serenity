@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Schumacher <timschumi@gmx.de>
+Date: Thu, 5 May 2022 18:49:17 +0200
+Subject: [PATCH] Add build system support for SerenityOS
+
+---
+ configure   | 2 ++
+ meson.build | 2 +-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/configure b/configure
+index 6ddfe4b5342805d9c6a7ae9480a084d4dc1e7d98..ee772d0076a55183388cc2030581e2ed9466e27e 100755
+--- a/configure
++++ b/configure
+@@ -373,6 +373,8 @@ elif check_define EMSCRIPTEN ; then
+   cross_compile="yes"
+ elif check_define __GNU__; then
+   host_os=gnu
++elif check_define __serenity__ ; then
++  host_os=serenity
+ else
+   # This is a fatal error, but don't report it yet, because we
+   # might be going to just print the --help text, or it might
+diff --git a/meson.build b/meson.build
+index 40e3f4ec44c8d36c44ec505bc4f54cbe5724ea73..69777176b2ced3e66b92bf244595d76012cd2ba2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1371,7 +1371,7 @@ spice_headers = spice.partial_dependency(compile_args: true, includes: true)
+ rt = not_found
+ if host_os != 'windows'
+   have_shm_open = cc.has_function('shm_open')
+-  if not have_shm_open
++  if not have_shm_open and host_os != 'serenity'
+     rt = cc.find_library('rt', required: true)
+   endif
+ endif

@@ -1,44 +1,66 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include <Kernel/DoubleBuffer.h>
+#include <Kernel/FileSystem/File.h>
+#include <Kernel/Library/DoubleBuffer.h>
+#include <Kernel/Locking/Mutex.h>
+#include <Kernel/Tasks/DeprecatedWaitQueue.h>
 #include <Kernel/UnixTypes.h>
-#include <Kernel/File.h>
 
-class FileDescriptor;
+namespace Kernel {
+
+class OpenFileDescription;
 
 class FIFO final : public File {
 public:
-    enum class Direction : byte {
-        Neither, Reader, Writer
+    enum class Direction : u8 {
+        Neither,
+        Reader,
+        Writer
     };
 
-    static RetainPtr<FIFO> from_fifo_id(dword);
+    enum class ShouldBlock : u8 {
+        No,
+        Yes,
+    };
 
-    static Retained<FIFO> create(uid_t);
+    static ErrorOr<NonnullRefPtr<FIFO>> try_create(UserID);
     virtual ~FIFO() override;
 
-    uid_t uid() const { return m_uid; }
+    UserID uid() const { return m_uid; }
 
-    Retained<FileDescriptor> open_direction(Direction);
-
-    void attach(Direction);
-    void detach(Direction);
+    ErrorOr<NonnullRefPtr<OpenFileDescription>> open_direction(Direction, ShouldBlock);
 
 private:
     // ^File
-    virtual ssize_t write(FileDescriptor&, const byte*, ssize_t) override;
-    virtual ssize_t read(FileDescriptor&, byte*, ssize_t) override;
-    virtual bool can_read(FileDescriptor&) const override;
-    virtual bool can_write(FileDescriptor&) const override;
-    virtual String absolute_path(FileDescriptor&) const override;
-    virtual const char* class_name() const override { return "FIFO"; }
+    virtual ErrorOr<size_t> write(OpenFileDescription&, u64, UserOrKernelBuffer const&, size_t) override;
+    virtual ErrorOr<size_t> read(OpenFileDescription&, u64, UserOrKernelBuffer&, size_t) override;
+    virtual ErrorOr<struct stat> stat() const override;
+    virtual void detach(OpenFileDescription&) override;
+    virtual bool can_read(OpenFileDescription const&, u64) const override;
+    virtual bool can_write(OpenFileDescription const&, u64) const override;
+    virtual ErrorOr<NonnullOwnPtr<KString>> pseudo_path(OpenFileDescription const&) const override;
+    virtual StringView class_name() const override { return "FIFO"sv; }
     virtual bool is_fifo() const override { return true; }
 
-    explicit FIFO(uid_t);
+    explicit FIFO(UserID, NonnullOwnPtr<DoubleBuffer> buffer);
 
     unsigned m_writers { 0 };
     unsigned m_readers { 0 };
-    DoubleBuffer m_buffer;
+    NonnullOwnPtr<DoubleBuffer> m_buffer;
 
-    uid_t m_uid { 0 };
+    UserID m_uid { 0 };
+
+    int m_fifo_id { 0 };
+
+    DeprecatedWaitQueue m_read_open_queue;
+    DeprecatedWaitQueue m_write_open_queue;
+    Mutex m_open_lock;
 };
+
+}

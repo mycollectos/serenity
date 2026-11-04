@@ -1,49 +1,36 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include <Kernel/Net/IPv4Socket.h>
+#include <AK/Error.h>
+#include <Kernel/Locking/MutexProtected.h>
+#include <Kernel/Net/IP/Socket.h>
 
-class UDPSocketHandle;
+namespace Kernel {
 
 class UDPSocket final : public IPv4Socket {
 public:
-    static Retained<UDPSocket> create(int protocol);
+    static ErrorOr<NonnullRefPtr<UDPSocket>> try_create(int protocol, NonnullOwnPtr<DoubleBuffer> receive_buffer);
     virtual ~UDPSocket() override;
 
-    static UDPSocketHandle from_port(word);
+    static RefPtr<UDPSocket> from_port(u16);
+    static void for_each(Function<void(UDPSocket const&)>);
+    static ErrorOr<void> try_for_each(Function<ErrorOr<void>(UDPSocket const&)>);
 
 private:
-    explicit UDPSocket(int protocol);
-    virtual const char* class_name() const override { return "UDPSocket"; }
-    static Lockable<HashMap<word, UDPSocket*>>& sockets_by_port();
+    explicit UDPSocket(int protocol, NonnullOwnPtr<DoubleBuffer> receive_buffer);
+    virtual StringView class_name() const override { return "UDPSocket"sv; }
+    static MutexProtected<HashMap<u16, UDPSocket*>>& sockets_by_port();
 
-    virtual int protocol_receive(const ByteBuffer&, void* buffer, size_t buffer_size, int flags, sockaddr* addr, socklen_t* addr_length) override;
-    virtual int protocol_send(const void*, int) override;
-    virtual KResult protocol_connect(FileDescriptor&, ShouldBlock) override { return KSuccess; }
-    virtual int protocol_allocate_local_port() override;
-    virtual KResult protocol_bind() override;
+    virtual ErrorOr<size_t> protocol_receive(ReadonlyBytes raw_ipv4_packet, UserOrKernelBuffer& buffer, size_t buffer_size, int flags) override;
+    virtual ErrorOr<size_t> protocol_send(UserOrKernelBuffer const&, size_t) override;
+    virtual ErrorOr<size_t> protocol_size(ReadonlyBytes raw_ipv4_packet) override;
+    virtual ErrorOr<void> protocol_connect(OpenFileDescription&) override;
+    virtual ErrorOr<void> protocol_bind() override;
 };
 
-class UDPSocketHandle : public SocketHandle {
-public:
-    UDPSocketHandle() { }
-
-    UDPSocketHandle(RetainPtr<UDPSocket>&& socket)
-        : SocketHandle(move(socket))
-    {
-    }
-
-    UDPSocketHandle(UDPSocketHandle&& other)
-        : SocketHandle(move(other))
-    {
-    }
-
-    UDPSocketHandle(const UDPSocketHandle&) = delete;
-    UDPSocketHandle& operator=(const UDPSocketHandle&) = delete;
-
-    UDPSocket* operator->() { return &socket(); }
-    const UDPSocket* operator->() const { return &socket(); }
-
-    UDPSocket& socket() { return static_cast<UDPSocket&>(SocketHandle::socket()); }
-    const UDPSocket& socket() const { return static_cast<const UDPSocket&>(SocketHandle::socket()); }
-};
-
+}

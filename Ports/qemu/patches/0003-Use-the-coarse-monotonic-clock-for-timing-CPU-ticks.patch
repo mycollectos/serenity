@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tim Schumacher <timschumi@gmx.de>
+Date: Sat, 1 Oct 2022 02:46:48 +0200
+Subject: [PATCH] Use the coarse monotonic clock for timing CPU ticks
+
+While this loses quite a bit of accuracy (although to no apparent
+decrease in emulation quality), it helps avoiding the additional
+overhead of the `clock_gettime` syscall (as `CLOCK_MONOTONIC_COARSE`
+is forwarded using the mapped time page) and we don't have to do a
+HPET timer read for each tick.
+---
+ include/qemu/timer.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index 9a62ac8cded11cc5c538117bda6826d33ff3cc76..bb6b56ec19c6a601a0f1cded426d2beba51aee10 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -839,7 +839,7 @@ static inline int64_t get_clock(void)
+ {
+     if (use_rt_clock) {
+         struct timespec ts;
+-        clock_gettime(CLOCK_MONOTONIC, &ts);
++        clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+         return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+     } else {
+         /* XXX: using gettimeofday leads to problems if the date

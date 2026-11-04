@@ -1,46 +1,92 @@
+/*
+ * Copyright (c) 2018-2022, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include "Assertions.h"
-#include "Retainable.h"
-#include "RetainPtr.h"
+#include <AK/Assertions.h>
+#include <AK/RefCounted.h>
+#include <AK/RefPtr.h>
+#include <AK/StdLibExtras.h>
 
 namespace AK {
 
-template<typename T> class Weakable;
-template<typename T> class WeakPtr;
-
 template<typename T>
-class WeakLink : public Retainable<WeakLink<T>> {
-    friend class Weakable<T>;
+class Weakable;
+template<typename T>
+class WeakPtr;
+
+class WeakLink : public RefCounted<WeakLink> {
+    template<typename T>
+    friend class Weakable;
+    template<typename T>
+    friend class WeakPtr;
+
 public:
-    T* ptr() { return static_cast<T*>(m_ptr); }
-    const T* ptr() const { return static_cast<const T*>(m_ptr); }
+    template<typename T>
+    RefPtr<T> strong_ref() const
+    requires(IsBaseOf<RefCountedBase, T>)
+    {
+        return static_cast<T*>(m_ptr);
+    }
+
+    template<typename T>
+    T* unsafe_ptr() const
+    {
+        return static_cast<T*>(m_ptr);
+    }
+
+    bool is_null() const { return m_ptr == nullptr; }
+
+    void revoke() { m_ptr = nullptr; }
 
 private:
-    explicit WeakLink(T& weakable) : m_ptr(&weakable) { }
-    T* m_ptr;
+    template<typename T>
+    explicit WeakLink(T& weakable)
+        : m_ptr(&weakable)
+    {
+    }
+
+    mutable void* m_ptr { nullptr };
 };
 
 template<typename T>
 class Weakable {
 private:
     class Link;
+
 public:
-    WeakPtr<T> make_weak_ptr();
+    template<typename U = T>
+    WeakPtr<U> make_weak_ptr() const
+    {
+        return MUST(try_make_weak_ptr<U>());
+    }
+
+    template<typename U = T>
+    ErrorOr<WeakPtr<U>> try_make_weak_ptr() const;
 
 protected:
-    Weakable() { }
+    Weakable() = default;
 
     ~Weakable()
     {
-        if (m_link)
-            m_link->m_ptr = nullptr;
+        revoke_weak_ptrs();
+    }
+
+    void revoke_weak_ptrs()
+    {
+        if (auto link = move(m_link))
+            link->revoke();
     }
 
 private:
-    RetainPtr<WeakLink<T>> m_link;
+    mutable RefPtr<WeakLink> m_link;
 };
 
 }
 
+#if USING_AK_GLOBALLY
 using AK::Weakable;
+#endif

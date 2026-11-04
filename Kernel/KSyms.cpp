@@ -1,54 +1,82 @@
-#include "KSyms.h"
-#include "Process.h"
-#include "Scheduler.h"
-#include <Kernel/FileSystem/FileDescriptor.h>
-#include <AK/ELF/ELFLoader.h>
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/StackUnwinder.h>
 #include <AK/TemporaryChange.h>
+#include <Kernel/Arch/SafeMem.h>
+#include <Kernel/Arch/SmapDisabler.h>
+#include <Kernel/FileSystem/OpenFileDescription.h>
+#include <Kernel/KSyms.h>
+#include <Kernel/Sections.h>
+#include <Kernel/Tasks/Process.h>
+#include <Kernel/Tasks/Scheduler.h>
+#include <Kernel/kstdio.h>
 
-static KSym* s_ksyms;
-dword ksym_lowest_address;
-dword ksym_highest_address;
-dword ksym_count;
-bool ksyms_ready;
+namespace Kernel {
 
-static byte parse_hex_digit(char nibble)
+FlatPtr g_lowest_kernel_symbol_address = 0xffffffff;
+FlatPtr g_highest_kernel_symbol_address = 0;
+SetOnce g_kernel_symbols_available;
+
+extern "C" {
+__attribute__((section(".kernel_symbols"))) char kernel_symbols[8 * MiB] {};
+}
+
+static KernelSymbol* s_symbols;
+static size_t s_symbol_count = 0;
+
+UNMAP_AFTER_INIT static u8 parse_hex_digit(char nibble)
 {
     if (nibble >= '0' && nibble <= '9')
         return nibble - '0';
-    ASSERT(nibble >= 'a' && nibble <= 'f');
+    VERIFY(nibble >= 'a' && nibble <= 'f');
     return 10 + (nibble - 'a');
 }
 
-const KSym* ksymbolicate(dword address)
+FlatPtr address_for_kernel_symbol(StringView name)
 {
-    if (address < ksym_lowest_address || address > ksym_highest_address)
+    for (size_t i = 0; i < s_symbol_count; ++i) {
+        auto const& symbol = s_symbols[i];
+        if (name == symbol.name)
+            return symbol.address;
+    }
+    return 0;
+}
+
+KernelSymbol const* symbolicate_kernel_address(FlatPtr address)
+{
+    if (address < g_lowest_kernel_symbol_address || address > g_highest_kernel_symbol_address)
         return nullptr;
-    for (unsigned i = 0; i < ksym_count; ++i) {
-        if (address < s_ksyms[i + 1].address)
-            return &s_ksyms[i];
+    for (unsigned i = 0; i < s_symbol_count; ++i) {
+        if (address < s_symbols[i + 1].address)
+            return &s_symbols[i];
     }
     return nullptr;
 }
 
-static void load_ksyms_from_data(const ByteBuffer& buffer)
+UNMAP_AFTER_INIT static void load_kernel_symbols_from_data(Bytes buffer)
 {
-    ksym_lowest_address = 0xffffffff;
-    ksym_highest_address = 0;
-    auto* bufptr = (const char*)buffer.pointer();
-    auto* start_of_name = bufptr;
-    dword address = 0;
+    g_lowest_kernel_symbol_address = 0xffffffff;
+    g_highest_kernel_symbol_address = 0;
 
-    for (unsigned i = 0; i < 8; ++i)
-        ksym_count = (ksym_count << 4) | parse_hex_digit(*(bufptr++));
-    s_ksyms = static_cast<KSym*>(kmalloc_eternal(sizeof(KSym) * ksym_count));
+    auto* bufptr = (char*)buffer.data();
+    auto* start_of_name = bufptr;
+    FlatPtr address = 0;
+
+    for (size_t i = 0; i < 8; ++i)
+        s_symbol_count = (s_symbol_count << 4) | parse_hex_digit(*(bufptr++));
+    s_symbols = static_cast<KernelSymbol*>(kmalloc(sizeof(KernelSymbol) * s_symbol_count));
     ++bufptr; // skip newline
 
-    kprintf("Loading ksyms...");
+    dmesgln("Loading kernel symbol table...");
 
-    unsigned current_ksym_index = 0;
+    size_t current_symbol_index = 0;
 
-    while (bufptr < buffer.end_pointer()) {
-        for (unsigned i = 0; i < 8; ++i)
+    while ((u8 const*)bufptr < buffer.data() + buffer.size()) {
+        for (size_t i = 0; i < sizeof(void*) * 2; ++i)
             address = (address << 4) | parse_hex_digit(*(bufptr++));
         bufptr += 3;
         start_of_name = bufptr;
@@ -57,107 +85,130 @@ static void load_ksyms_from_data(const ByteBuffer& buffer)
                 break;
             }
         }
-        auto& ksym = s_ksyms[current_ksym_index];
-        ksym.address = address;
-        char* name = static_cast<char*>(kmalloc_eternal((bufptr - start_of_name) + 1));
-        memcpy(name, start_of_name, bufptr - start_of_name);
-        name[bufptr - start_of_name] = '\0';
-        ksym.name = name;
+        auto& ksym = s_symbols[current_symbol_index];
 
-        if (ksym.address < ksym_lowest_address)
-            ksym_lowest_address = ksym.address;
-        if (ksym.address > ksym_highest_address)
-            ksym_highest_address = ksym.address;
+        ksym.address = g_boot_info.kernel_load_base + address;
+        ksym.name = start_of_name;
+
+        *bufptr = '\0';
+
+        if (ksym.address < g_lowest_kernel_symbol_address)
+            g_lowest_kernel_symbol_address = ksym.address;
+        if (ksym.address > g_highest_kernel_symbol_address)
+            g_highest_kernel_symbol_address = ksym.address;
 
         ++bufptr;
-        ++current_ksym_index;
+        ++current_symbol_index;
     }
-    kprintf("ok\n");
-    ksyms_ready = true;
+    g_kernel_symbols_available.set();
 }
 
-[[gnu::noinline]] void dump_backtrace_impl(dword ebp, bool use_ksyms)
+NEVER_INLINE static void dump_backtrace_impl(FlatPtr frame_pointer, bool use_ksyms, PrintToScreen print_to_screen)
 {
-    if (!current) {
-        //hang();
-        return;
-    }
-    if (use_ksyms && !ksyms_ready) {
-        hang();
-        return;
-    }
+#define PRINT_LINE(string, length)                \
+    do {                                          \
+        if (print_to_screen == PrintToScreen::No) \
+            dbgputstr(string, length);            \
+        else                                      \
+            kernelcriticalputstr(string, length); \
+    } while (0)
+
+    SmapDisabler disabler;
+    if (use_ksyms && !g_kernel_symbols_available.was_set())
+        Processor::halt();
+
     struct RecognizedSymbol {
-        dword address;
-        const KSym* ksym;
+        FlatPtr address;
+        KernelSymbol const* symbol { nullptr };
     };
-    int max_recognized_symbol_count = 256;
+
+    constexpr size_t max_recognized_symbol_count = 256;
     RecognizedSymbol recognized_symbols[max_recognized_symbol_count];
-    int recognized_symbol_count = 0;
-    if (use_ksyms) {
-        for (dword* stack_ptr = (dword*)ebp; current->process().validate_read_from_kernel(LinearAddress((dword)stack_ptr)); stack_ptr = (dword*)*stack_ptr) {
-            dword retaddr = stack_ptr[1];
-            recognized_symbols[recognized_symbol_count++] = { retaddr, ksymbolicate(retaddr) };
-        }
-    } else {
-        for (dword* stack_ptr = (dword*)ebp; current->process().validate_read_from_kernel(LinearAddress((dword)stack_ptr)); stack_ptr = (dword*)*stack_ptr) {
-            dword retaddr = stack_ptr[1];
-            dbgprintf("%x (next: %x)\n", retaddr, stack_ptr ? (dword*)*stack_ptr : 0);
-        }
+    size_t recognized_symbol_count = 0;
+
+    MUST(AK::unwind_stack_from_frame_pointer(
+        frame_pointer,
+        [](FlatPtr address) -> ErrorOr<FlatPtr> {
+            if (address < g_boot_info.kernel_mapping_base)
+                return EINVAL;
+
+            FlatPtr value;
+            void* fault_at;
+            if (!safe_memcpy(&value, bit_cast<FlatPtr*>(address), sizeof(FlatPtr), fault_at))
+                return EFAULT;
+
+            return value;
+        },
+        [use_ksyms, print_to_screen, &recognized_symbol_count, &recognized_symbols](AK::StackFrame stack_frame) -> ErrorOr<IterationDecision> {
+            if (use_ksyms) {
+                if (recognized_symbol_count >= max_recognized_symbol_count)
+                    return IterationDecision::Break;
+
+                recognized_symbols[recognized_symbol_count++] = { stack_frame.return_address, symbolicate_kernel_address(stack_frame.return_address) };
+            } else {
+                auto message_buffer = MUST(FixedStringBuffer<28>::formatted("Kernel + {:p}\n"sv, stack_frame.return_address - g_boot_info.kernel_load_base));
+                auto message = message_buffer.representable_view();
+                PRINT_LINE(message.characters_without_null_termination(), message.length());
+            }
+            return IterationDecision::Continue;
+        }));
+
+    if (!use_ksyms)
         return;
-    }
-    ASSERT(recognized_symbol_count < max_recognized_symbol_count);
-    size_t bytes_needed = 0;
-    for (int i = 0; i < recognized_symbol_count; ++i) {
-        auto& symbol = recognized_symbols[i];
-        bytes_needed += (symbol.ksym ? strlen(symbol.ksym->name) : 0) + 8 + 16;
-    }
-    for (int i = 0; i < recognized_symbol_count; ++i) {
+
+    VERIFY(recognized_symbol_count <= max_recognized_symbol_count);
+    for (size_t i = 0; i < recognized_symbol_count; ++i) {
         auto& symbol = recognized_symbols[i];
         if (!symbol.address)
             break;
-        if (!symbol.ksym) {
-            if (current->process().elf_loader() && current->process().elf_loader()->has_symbols()) {
-                dbgprintf("%p  %s\n", symbol.address, current->process().elf_loader()->symbolicate(symbol.address).characters());
-            } else {
-                dbgprintf("%p (no ELF symbols for process)\n", symbol.address);
-            }
+        if (!symbol.symbol) {
+            auto message_buffer = MUST(FixedStringBuffer<28>::formatted("Kernel + {:p}\n"sv, symbol.address - g_boot_info.kernel_load_base));
+            auto message = message_buffer.representable_view();
+            PRINT_LINE(message.characters_without_null_termination(), message.length());
             continue;
         }
-        unsigned offset = symbol.address - symbol.ksym->address;
-        if (symbol.ksym->address == ksym_highest_address && offset > 4096)
-            dbgprintf("%p\n", symbol.address);
-        else
-            dbgprintf("%p  %s +%u\n", symbol.address, symbol.ksym->name, offset);
+        size_t offset = symbol.address - symbol.symbol->address;
+        if (symbol.symbol->address == g_highest_kernel_symbol_address && offset > 4096) {
+            auto message_buffer = MUST(FixedStringBuffer<28>::formatted("Kernel + {:p}\n"sv, symbol.address - g_boot_info.kernel_load_base));
+            auto message = message_buffer.representable_view();
+            PRINT_LINE(message.characters_without_null_termination(), message.length());
+        } else {
+            constexpr auto buffer_size = 255;
+            constexpr auto maximum_printable_name_length = buffer_size - (sizeof("Kernel + 0x   +\n") - 1 + sizeof(FlatPtr) * 4);
+            size_t symbol_name_length = strlen(symbol.symbol->name);
+            auto symbol_name = StringView(symbol.symbol->name, min(symbol_name_length, maximum_printable_name_length));
+            auto message_buffer = MUST(FixedStringBuffer<buffer_size>::formatted("Kernel + {:p}  {} +{:#x}\n"sv, symbol.address - g_boot_info.kernel_load_base, symbol_name, offset));
+            auto message = message_buffer.representable_view();
+            PRINT_LINE(message.characters_without_null_termination(), message.length());
+        }
     }
 }
 
-void dump_backtrace()
+void dump_backtrace_from_base_pointer(FlatPtr base_pointer)
+{
+    // FIXME: Change signature of dump_backtrace_impl to use an enum instead of a bool.
+    dump_backtrace_impl(base_pointer, /*use_ksym=*/false, PrintToScreen::No);
+}
+
+void dump_backtrace(PrintToScreen print_to_screen)
 {
     static bool in_dump_backtrace = false;
-    if (in_dump_backtrace) {
-        dbgprintf("dump_backtrace() called from within itself, what the hell is going on!\n");
+    if (in_dump_backtrace)
         return;
-    }
     TemporaryChange change(in_dump_backtrace, true);
-    dword ebp;
-    asm volatile("movl %%ebp, %%eax":"=a"(ebp));
-    dump_backtrace_impl(ebp, ksyms_ready);
+    TemporaryChange disable_kmalloc_stacks(g_dump_kmalloc_stacks, false);
+
+    FlatPtr base_pointer = (FlatPtr)__builtin_frame_address(0);
+    dump_backtrace_impl(base_pointer, g_kernel_symbols_available.was_set(), print_to_screen);
 }
 
-void init_ksyms()
+UNMAP_AFTER_INIT void load_kernel_symbol_table()
 {
-    ksyms_ready = false;
-    ksym_lowest_address = 0xffffffff;
-    ksym_highest_address = 0;
-    ksym_count = 0;
+    auto kernel_symbols_size = strnlen(kernel_symbols, sizeof(kernel_symbols));
+    // If we're hitting this VERIFY the kernel symbol file has grown beyond
+    // the array size of kernel_symbols. Try making the array larger.
+    VERIFY(kernel_symbols_size != sizeof(kernel_symbols));
+    load_kernel_symbols_from_data({ kernel_symbols, kernel_symbols_size });
 }
 
-void load_ksyms()
-{
-    auto result = VFS::the().open("/kernel.map", 0, 0, *VFS::the().root_inode());
-    ASSERT(!result.is_error());
-    auto descriptor = result.value();
-    auto buffer = descriptor->read_entire_file();
-    ASSERT(buffer);
-    load_ksyms_from_data(buffer);
 }

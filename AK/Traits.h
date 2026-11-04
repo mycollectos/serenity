@@ -1,41 +1,83 @@
+/*
+ * Copyright (c) 2018-2022, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #pragma once
 
-#include "kstdio.h"
-#include "HashFunctions.h"
+#include <AK/BitCast.h>
+#include <AK/Concepts.h>
+#include <AK/Forward.h>
+#include <AK/HashFunctions.h>
+#include <AK/StringHash.h>
 
 namespace AK {
 
 template<typename T>
-struct Traits 
-{
-};
-
-template<>
-struct Traits<int> {
-    static unsigned hash(int i) { return int_hash(i); }
-    static void dump(int i) { kprintf("%d", i); }
-};
-
-template<>
-struct Traits<unsigned> {
-    static unsigned hash(unsigned u) { return int_hash(u); }
-    static void dump(unsigned u) { kprintf("%u", u); }
-};
-
-template<>
-struct Traits<word> {
-    static unsigned hash(unsigned u) { return int_hash(u); }
-    static void dump(unsigned u) { kprintf("%u", u); }
+struct DefaultTraits {
+    using PeekType = T&;
+    using ConstPeekType = T const&;
+    static constexpr bool is_trivial() { return false; }
+    static constexpr bool is_trivially_serializable() { return false; }
+    static constexpr bool equals(T const& a, T const& b) { return a == b; }
+    template<Concepts::HashCompatible<T> U>
+    static bool equals(T const& self, U const& other) { return self == other; }
 };
 
 template<typename T>
-struct Traits<T*> {
-    static unsigned hash(const T* p)
+struct Traits : public DefaultTraits<T> {
+};
+
+template<typename T>
+struct Traits<T const> : public Traits<T> {
+    using PeekType = typename Traits<T>::ConstPeekType;
+};
+
+template<Integral T>
+struct Traits<T> : public DefaultTraits<T> {
+    static constexpr bool is_trivial() { return true; }
+    static constexpr bool is_trivially_serializable() { return true; }
+    static unsigned hash(T value)
     {
-        return int_hash((dword)p);
+        if constexpr (sizeof(T) < 8)
+            return int_hash(value);
+        else
+            return u64_hash(value);
     }
-    static void dump(const T* p) { kprintf("%p", p); }
+};
+
+#ifndef KERNEL
+template<FloatingPoint T>
+struct Traits<T> : public DefaultTraits<T> {
+    static constexpr bool is_trivial() { return true; }
+    static constexpr bool is_trivially_serializable() { return true; }
+    static unsigned hash(T value)
+    {
+        if constexpr (sizeof(T) < 8)
+            return int_hash(bit_cast<u32>(value));
+        else
+            return u64_hash(bit_cast<u64>(value));
+    }
+};
+#endif
+
+template<typename T>
+requires(IsPointer<T> && !Detail::IsPointerOfType<char, T>) struct Traits<T> : public DefaultTraits<T> {
+    static unsigned hash(T p) { return ptr_hash(bit_cast<FlatPtr>(p)); }
+    static constexpr bool is_trivial() { return true; }
+};
+
+template<Enum T>
+struct Traits<T> : public DefaultTraits<T> {
+    static unsigned hash(T value) { return Traits<UnderlyingType<T>>::hash(to_underlying(value)); }
+    static constexpr bool is_trivial() { return Traits<UnderlyingType<T>>::is_trivial(); }
+    static constexpr bool is_trivially_serializable() { return Traits<UnderlyingType<T>>::is_trivially_serializable(); }
 };
 
 }
 
+#if USING_AK_GLOBALLY
+using AK::DefaultTraits;
+using AK::Traits;
+#endif

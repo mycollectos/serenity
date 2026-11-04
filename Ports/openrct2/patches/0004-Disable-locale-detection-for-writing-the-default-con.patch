@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Julian=20Offenh=C3=A4user?= <offenhaeuser@protonmail.com>
+Date: Wed, 8 Feb 2023 11:32:30 +0100
+Subject: [PATCH] Disable locale detection for writing the default config.ini
+
+At the time of writing, locale support in Serenity is not great. We always returned the "C" locale, which this code interpreted wrong. Since this is just used for writing a default value to the game config (which can be changed later), we just default to English.
+---
+ src/openrct2/platform/Platform.Linux.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/openrct2/platform/Platform.Linux.cpp b/src/openrct2/platform/Platform.Linux.cpp
+index ac5357dba07442a508c71e52a9636d06b79acc6e..1a311fec87f325be6519ef7379115861198a70d2 100644
+--- a/src/openrct2/platform/Platform.Linux.cpp
++++ b/src/openrct2/platform/Platform.Linux.cpp
+@@ -243,6 +243,7 @@ namespace OpenRCT2::Platform
+ 
+     uint16_t GetLocaleLanguage()
+     {
++#if !defined(__serenity__)
+         const char* langString = setlocale(LC_MESSAGES, "");
+         if (langString != nullptr)
+         {
+@@ -303,6 +304,7 @@ namespace OpenRCT2::Platform
+                 }
+             }
+         }
++#endif
+         return LANGUAGE_ENGLISH_UK;
+     }
+ 

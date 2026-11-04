@@ -1,71 +1,53 @@
-#include <AK/Assertions.h>
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
 #include <AK/HashMap.h>
-#include <AK/StringBuilder.h>
-#include <LibC/errno_numbers.h>
+#include <AK/Singleton.h>
+#include <AK/StringView.h>
 #include <Kernel/FileSystem/FileSystem.h>
 #include <Kernel/FileSystem/Inode.h>
-#include <Kernel/VM/MemoryManager.h>
+#include <Kernel/FileSystem/VirtualFileSystem.h>
+#include <Kernel/Interrupts/InterruptDisabler.h>
+#include <Kernel/Memory/MemoryManager.h>
 #include <Kernel/Net/LocalSocket.h>
 
-static dword s_lastFileSystemID;
-static HashMap<dword, FS*>* s_fs_map;
+namespace Kernel {
 
-static HashMap<dword, FS*>& all_fses()
-{
-    if (!s_fs_map)
-        s_fs_map = new HashMap<dword, FS*>();
-    return *s_fs_map;
-}
+static u32 s_lastFileSystemID;
 
-
-FS::FS()
+FileSystem::FileSystem()
     : m_fsid(++s_lastFileSystemID)
 {
-    all_fses().set(m_fsid, this);
 }
 
-FS::~FS()
+FileSystem::~FileSystem()
 {
-    all_fses().remove(m_fsid);
 }
 
-FS* FS::from_fsid(dword id)
+ErrorOr<void> FileSystem::prepare_to_unmount(Inode& mount_guest_inode)
 {
-    auto it = all_fses().find(id);
-    if (it != all_fses().end())
-        return (*it).value;
-    return nullptr;
+    return m_attach_count.with([&](auto& attach_count) -> ErrorOr<void> {
+        dbgln_if(VFS_DEBUG, "VFS: File system {} (id {}) is attached {} time(s)", class_name(), m_fsid.value(), attach_count);
+        if (attach_count == 1)
+            return prepare_to_clear_last_mount(mount_guest_inode);
+        return {};
+    });
 }
 
-FS::DirectoryEntry::DirectoryEntry(const char* n, InodeIdentifier i, byte ft)
-    : name_length(strlen(n))
+FileSystem::DirectoryEntryView::DirectoryEntryView(StringView n, InodeIdentifier i, u8 ft)
+    : name(n)
     , inode(i)
     , file_type(ft)
 {
-    memcpy(name, n, name_length);
-    name[name_length] = '\0';
 }
 
-FS::DirectoryEntry::DirectoryEntry(const char* n, int nl, InodeIdentifier i, byte ft)
-    : name_length(nl)
-    , inode(i)
-    , file_type(ft)
+void FileSystem::sync()
 {
-    memcpy(name, n, nl);
-    name[nl] = '\0';
+    Inode::sync_all();
+    VirtualFileSystem::sync_filesystems();
 }
 
-void FS::sync()
-{
-    Inode::sync();
-
-    Vector<Retained<FS>, 32> fses;
-    {
-        InterruptDisabler disabler;
-        for (auto& it : all_fses())
-            fses.append(*it.value);
-    }
-
-    for (auto fs : fses)
-        fs->flush_writes();
 }

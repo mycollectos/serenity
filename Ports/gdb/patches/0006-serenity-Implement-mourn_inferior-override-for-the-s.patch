@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian Gianforcaro <b.gianfo@gmail.com>
+Date: Sun, 20 Feb 2022 00:44:08 -0800
+Subject: [PATCH] serenity: Implement mourn_inferior override for the
+ serenity_nat_target
+
+We need to pass `WNOHANG` to our `waitpid(..)` call on SerenityOS,
+otherwise we will wait forever.
+---
+ gdb/serenity-nat.c | 14 ++++++++++++++
+ gdb/serenity-nat.h |  4 ++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/gdb/serenity-nat.c b/gdb/serenity-nat.c
+index 104e56938bafe27959e03c274768bd294b3ce0a4..c9bad745d51c68500306adc2996a23ed40d82326 100644
+--- a/gdb/serenity-nat.c
++++ b/gdb/serenity-nat.c
+@@ -70,6 +70,20 @@ ptid_t serenity_nat_target::wait (ptid_t ptid, struct target_waitstatus* ourstat
+     return ptid_t (pid);
+ }
+ 
++void serenity_nat_target::mourn_inferior ()
++{
++    int status;
++
++    /* Wait just one more time to collect the inferior's exit status.
++     * Do not check whether this succeeds though, since we may be
++     * dealing with a process that we attached to. Such a process will
++     * only report its exit status to its original parent.
++     */
++    waitpid (inferior_ptid.pid (), &status, WNOHANG);
++
++    inf_child_target::mourn_inferior ();
++}
++
+ void
+ serenity_nat_target::post_startup_inferior (ptid_t ptid)
+ {
+diff --git a/gdb/serenity-nat.h b/gdb/serenity-nat.h
+index 9ae3b87bdb855e980376412f3e21262ab6e2cf2a..df4682088759e8d3678779a38403dc97e7662291 100644
+--- a/gdb/serenity-nat.h
++++ b/gdb/serenity-nat.h
+@@ -13,6 +13,10 @@ class serenity_nat_target : public inf_ptrace_target
+ {
+   ptid_t wait (ptid_t, struct target_waitstatus *, target_wait_flags) override;
+ 
++  void mourn_inferior ();
++
++  void post_startup_inferior (ptid_t) override;
++
+ private:
+   bool m_attach_before_continue_called { false };
+ };
